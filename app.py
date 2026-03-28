@@ -12,9 +12,9 @@ app = Flask(__name__)
 # API 配置
 # =====================================================
 bitget_config = {
-    'apiKey':   os.getenv('BITGET_API_KEY', ''),
-    'secret':   os.getenv('BITGET_SECRET', ''),
-    'password': os.getenv('BITGET_PASSWORD', ''),
+    'apiKey':   os.getenv('BITGET_API_KEY', 'bg_d94506261d1e5337d124ddade02149c6'),
+    'secret':   os.getenv('BITGET_SECRET', '3aa1590f429f87f2d25e6024938a10cb003cf78e3783007540abaea6f1fa6ed2'),
+    'password': os.getenv('BITGET_PASSWORD', 'Jeff5466'),
     'enableRateLimit': True,
     'options': {'defaultType': 'swap', 'defaultMarginMode': 'cross'}
 }
