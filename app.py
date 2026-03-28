@@ -12,18 +12,18 @@ app = Flask(__name__)
 # API 配置
 # =====================================================
 bitget_config = {
-    'apiKey':   os.getenv('BITGET_API_KEY', ''),
-    'secret':   os.getenv('BITGET_SECRET', ''),
-    'password': os.getenv('BITGET_PASSWORD', ''),
+    'apiKey':   os.getenv('BITGET_API_KEY', 'bg_d94506261d1e5337d124ddade02149c6'),
+    'secret':   os.getenv('BITGET_SECRET', '3aa1590f429f87f2d25e6024938a10cb003cf78e3783007540abaea6f1fa6ed2'),
+    'password': os.getenv('BITGET_PASSWORD', 'Jeff5466'),
     'enableRateLimit': True,
     'options': {'defaultType': 'swap', 'defaultMarginMode': 'cross'}
 }
 exchange = ccxt.bitget(bitget_config)
 exchange.timeout = 10000   # 10秒 API 超時，絕不無限等待
 exchange.enableRateLimit = True
-PANIC_API_KEY   = os.getenv('PANIC_API_KEY', '')
-OPENAI_API_KEY  = os.getenv('OPENAI_API_KEY', '')
-ANTHROPIC_KEY   = os.getenv('ANTHROPIC_API_KEY', '')
+PANIC_API_KEY   = os.getenv('PANIC_API_KEY', 'cde101d65a00a418e451ae0118ed0835275781e1')
+OPENAI_API_KEY  = os.getenv('OPENAI_API_KEY', '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')
+ANTHROPIC_KEY   = os.getenv('ANTHROPIC_API_KEY', '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')
 ORDER_THRESHOLD         = 50   # 預設門檻 50
 ORDER_THRESHOLD_DEFAULT = 50   # 預設值
 ORDER_THRESHOLD_HIGH    = 55   # 持續滿倉後提高到 55
