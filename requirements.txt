@@ -1,6 +1,0 @@
-flask>=2.3.0
-ccxt>=4.0.0
-pandas>=2.0.0
-pandas-ta>=0.3.14b
-requests>=2.31.0
-gunicorn
