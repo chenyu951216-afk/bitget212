@@ -35,7 +35,7 @@ ORDER_THRESHOLD_FLOOR   = 48   # 最低只降到 48
 # =====================================================
 RISK_PCT              = 0.05      # 每單名目資金使用總資產 5%
 ATR_RISK_PCT          = 0.01      # 每單實際風險預算 1%（用停損距離換算倉位）
-MIN_MARGIN_PCT        = 0.03      # 動態保證金下限 3%
+MIN_MARGIN_PCT        = 0.01      # 動態保證金下限 1%（至少投入總資金1%保證金）
 MAX_MARGIN_PCT        = 0.08      # 動態保證金上限 8%
 MAX_OPEN_POSITIONS    = 7         # 短線總持倉上限
 MAX_SAME_DIRECTION    = 5         # 同方向最多 5 筆
@@ -4346,22 +4346,24 @@ def clamp(v, lo, hi):
 
 def calc_dynamic_margin_pct(score, atr_ratio, trend_aligned, squeeze_ready, extended_risk, same_side_count, market_dir="中性", market_strength=0.0):
     """
-    根據訊號品質/結構/波動決定當下保證金比例，限制 3% ~ 8%。
-    - 剛過門檻：偏小倉 3%~4.5%
-    - 中強訊號：5%~7%
+    根據訊號品質/結構/波動決定當下保證金比例，限制 1% ~ 8%。
+    - 弱訊號：1%~2%
+    - 過門檻：3.5%~5.5%
     - 強共振：最高 8%
     """
     s = abs(float(score or 0))
     atr_ratio = float(atr_ratio or 0)
 
-    if s < 50:
-        base = 0.03
+    if s < 48:
+        base = 0.01
+    elif s < 50:
+        base = 0.02
     elif s < 52:
-        base = 0.045
+        base = 0.04
     elif s < 54:
-        base = 0.06
+        base = 0.055
     else:
-        base = 0.075
+        base = 0.07
 
     adj = 0.0
     if trend_aligned:
@@ -4525,24 +4527,30 @@ def plan_scale_in_orders(sig, total_qty, entry_price, atr):
 
 def compute_order_size(sym, entry_price, stop_price, equity, lev, margin_pct=None):
     """
-    倉位大小 = min(名目資金上限, 停損風險上限)
-    不刪原本 5% 資金使用邏輯，但增加 ATR/停損距離風險校準。
+    倉位大小 = min(名目資金上限, 停損風險上限)，但實際保證金至少為總資金 1%。
+    槓桿放大多少不影響這個底線：先保證最低投入保證金，再用槓桿換算口數。
     """
     try:
         entry_price = float(entry_price)
         stop_price  = float(stop_price)
         equity      = max(float(equity), 1.0)
+        lev         = max(float(lev), 1.0)
         stop_dist   = abs(entry_price - stop_price)
         if stop_dist <= 0:
             stop_dist = entry_price * 0.01
 
-        if margin_pct is None:
-            margin_pct = RISK_PCT
-        nominal_cap = max(equity * float(margin_pct), 1.0)
+        selected_margin_pct = float(margin_pct if margin_pct is not None else RISK_PCT)
+        selected_margin_pct = clamp(selected_margin_pct, MIN_MARGIN_PCT, MAX_MARGIN_PCT)
+        min_margin_usdt = max(equity * MIN_MARGIN_PCT, 1.0)
+        target_margin_usdt = max(equity * selected_margin_pct, min_margin_usdt)
+
         risk_budget = max(equity * ATR_RISK_PCT, 0.5)
         qty_by_risk = risk_budget / stop_dist
-        qty_by_cap  = nominal_cap * max(float(lev), 1.0) / entry_price
-        raw_qty     = min(qty_by_risk, qty_by_cap)
+        qty_by_target_margin = target_margin_usdt * lev / entry_price
+        qty_by_floor_margin  = min_margin_usdt * lev / entry_price
+
+        raw_qty = min(qty_by_risk, qty_by_target_margin)
+        raw_qty = max(raw_qty, qty_by_floor_margin)
 
         try:
             mkt = exchange.market(sym)
@@ -4553,12 +4561,15 @@ def compute_order_size(sym, entry_price, stop_price, equity, lev, margin_pct=Non
             pass
 
         qty = float(exchange.amount_to_precision(sym, raw_qty))
-        notional_usdt = qty * entry_price / max(float(lev), 1.0)
+        used_margin_usdt = qty * entry_price / lev
+        used_margin_pct = used_margin_usdt / equity if equity > 0 else selected_margin_pct
+        used_margin_pct = clamp(used_margin_pct, MIN_MARGIN_PCT, MAX_MARGIN_PCT)
         est_risk_usdt = qty * stop_dist
-        return qty, round(notional_usdt, 4), round(est_risk_usdt, 4), round(stop_dist, 6), round(float(margin_pct), 4)
+        return qty, round(used_margin_usdt, 4), round(est_risk_usdt, 4), round(stop_dist, 6), round(float(used_margin_pct), 4)
     except Exception as e:
         print("倉位計算失敗 {}: {}".format(sym, e))
-        fallback_margin = float(margin_pct or RISK_PCT)
+        fallback_margin = clamp(float(margin_pct or RISK_PCT), MIN_MARGIN_PCT, MAX_MARGIN_PCT)
+        fallback_margin = max(fallback_margin, MIN_MARGIN_PCT)
         fallback_notional = max(float(equity) * fallback_margin, 1.0)
         qty = float(exchange.amount_to_precision(sym, fallback_notional * max(float(lev),1.0) / max(float(entry_price),1e-9)))
         return qty, round(fallback_notional, 4), 0.0, abs(float(entry_price) - float(stop_price)), round(fallback_margin, 4)
