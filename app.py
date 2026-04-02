@@ -1573,6 +1573,110 @@ def verify_protection_orders(symbol, side, sl_price, tp_price):
     return sl_ok, tp_ok
 
 
+def ensure_exchange_protection(sym, side, pos_side, qty, sl_price, tp_price, verify_wait_sec=1.0):
+    """下主單後立即補掛交易所保護單；若止損驗證失敗，回傳 sl_ok=False。"""
+    sl_side = 'sell' if side == 'buy' else 'buy'
+    qty = float(qty or 0)
+    sl_ok = False
+    tp_ok = False
+
+    if qty <= 0:
+        PROTECTION_STATE[sym] = {
+            'sl_ok': False, 'tp_ok': False, 'sl': round(float(sl_price or 0), 8),
+            'tp': round(float(tp_price or 0), 8), 'side': (side or '').lower(),
+            'updated_at': tw_now_str(), 'note': 'qty<=0，未掛保護單'
+        }
+        update_state(protection_state=dict(PROTECTION_STATE))
+        return False, False
+
+    # 止損單（三種格式依序嘗試）
+    try:
+        exchange.create_order(sym, 'market', sl_side, qty, params={
+            'reduceOnly':  True,
+            'stopPrice':   str(sl_price),
+            'orderType':   'stop',
+            'posSide':     pos_side,
+            'tdMode':      'cross',
+        })
+        print("止損單成功(格式1): {} @{}".format(sym, sl_price))
+        sl_ok = True
+    except Exception:
+        pass
+
+    if not sl_ok:
+        try:
+            exchange.create_order(sym, 'market', sl_side, qty, params={
+                'reduceOnly':    True,
+                'stopLossPrice': str(sl_price),
+                'posSide':       pos_side,
+                'tdMode':        'cross',
+            })
+            print("止損單成功(格式2): {} @{}".format(sym, sl_price))
+            sl_ok = True
+        except Exception:
+            pass
+
+    if not sl_ok:
+        try:
+            exchange.create_order(sym, 'market', sl_side, qty, params={
+                'reduceOnly':   True,
+                'triggerPrice': str(sl_price),
+                'triggerType':  'mark_price',
+                'posSide':      pos_side,
+            })
+            print("止損單成功(格式3): {} @{}".format(sym, sl_price))
+            sl_ok = True
+        except Exception as e3:
+            print("止損三種格式都失敗: {}".format(e3))
+
+    # 止盈單（兩種格式依序嘗試）
+    try:
+        exchange.create_order(sym, 'market', sl_side, qty, params={
+            'reduceOnly':  True,
+            'stopPrice':   str(tp_price),
+            'orderType':   'takeProfit',
+            'posSide':     pos_side,
+            'tdMode':      'cross',
+        })
+        print("止盈單成功(格式1): {} @{}".format(sym, tp_price))
+        tp_ok = True
+    except Exception:
+        pass
+
+    if not tp_ok:
+        try:
+            exchange.create_order(sym, 'market', sl_side, qty, params={
+                'reduceOnly':      True,
+                'takeProfitPrice': str(tp_price),
+                'posSide':         pos_side,
+                'tdMode':          'cross',
+            })
+            print("止盈單成功(格式2): {} @{}".format(sym, tp_price))
+            tp_ok = True
+        except Exception as tp_err:
+            print("止盈掛單失敗，依賴移動止盈系統: {}".format(tp_err))
+
+    # 以交易所開放掛單再次驗證，避免 create_order 成功但其實沒掛上
+    try:
+        time.sleep(max(float(verify_wait_sec), 0.2))
+    except Exception:
+        pass
+    v_sl_ok, v_tp_ok = verify_protection_orders(sym, side, sl_price, tp_price)
+    sl_ok = bool(sl_ok or v_sl_ok)
+    tp_ok = bool(tp_ok or v_tp_ok)
+    PROTECTION_STATE[sym] = {
+        'sl_ok': sl_ok,
+        'tp_ok': tp_ok,
+        'sl': round(float(sl_price or 0), 8),
+        'tp': round(float(tp_price or 0), 8),
+        'side': (side or '').lower(),
+        'updated_at': tw_now_str(),
+        'note': '交易所止損已驗證' if sl_ok else '交易所止損驗證失敗',
+    }
+    update_state(protection_state=dict(PROTECTION_STATE))
+    return sl_ok, tp_ok
+
+
 PENDING_LEARN_IDS = set()
 
 def _parse_time_to_ms(s):
@@ -4791,80 +4895,13 @@ def place_order(sig):
         print("主單成功: {} {} {}口 | {} | {}".format(sym, side, market_qty if market_qty else amt, fvg_note, scale_plan.get('note', '單筆進場')))
         touch_entry_lock(sym)
 
-        # Step2+3: Bitget 止損止盈（移動止盈系統為主，這裡掛初始止損）
-        sl_side = 'sell' if side == 'buy' else 'buy'
-
-        # 止損單（三種格式依序嘗試）
-        sl_ok = False
-        # 格式1：Bitget TPSL
-        try:
-            exchange.create_order(sym, 'market', sl_side, amt, params={
-                'reduceOnly':  True,
-                'stopPrice':   str(sl_price),
-                'orderType':   'stop',
-                'posSide':     pos_side,
-                'tdMode':      'cross',
-            })
-            print("止損單成功(格式1): {} @{}".format(sym, sl_price))
-            sl_ok = True
-        except Exception as e1:
-            pass
-
+        # Step2+3: 主單後立刻補掛交易所保護單，並做驗證；若交易所止損沒掛上，立即平倉保護
+        protected_qty = market_qty if market_qty else amt
+        sl_ok, tp_ok = ensure_exchange_protection(sym, side, pos_side, protected_qty, sl_price, tp_price)
         if not sl_ok:
-            # 格式2：stopLossPrice
-            try:
-                exchange.create_order(sym, 'market', sl_side, amt, params={
-                    'reduceOnly':    True,
-                    'stopLossPrice': str(sl_price),
-                    'posSide':       pos_side,
-                    'tdMode':        'cross',
-                })
-                print("止損單成功(格式2): {} @{}".format(sym, sl_price))
-                sl_ok = True
-            except Exception as e2:
-                pass
-
-        if not sl_ok:
-            # 格式3：triggerPrice（最後備用）
-            try:
-                exchange.create_order(sym, 'market', sl_side, amt, params={
-                    'reduceOnly':    True,
-                    'triggerPrice':  str(sl_price),
-                    'triggerType':   'mark_price',
-                    'posSide':       pos_side,
-                })
-                print("止損單成功(格式3): {} @{}".format(sym, sl_price))
-                sl_ok = True
-            except Exception as e3:
-                print("止損三種格式都失敗，依賴移動止損系統: {}".format(e3))
-
-        # 止盈單（三種格式依序嘗試）
-        tp_ok = False
-        try:
-            exchange.create_order(sym, 'market', sl_side, amt, params={
-                'reduceOnly':  True,
-                'stopPrice':   str(tp_price),
-                'orderType':   'takeProfit',
-                'posSide':     pos_side,
-                'tdMode':      'cross',
-            })
-            print("止盈單成功(格式1): {} @{}".format(sym, tp_price))
-            tp_ok = True
-        except:
-            pass
-
-        if not tp_ok:
-            try:
-                exchange.create_order(sym, 'market', sl_side, amt, params={
-                    'reduceOnly':       True,
-                    'takeProfitPrice':  str(tp_price),
-                    'posSide':          pos_side,
-                    'tdMode':           'cross',
-                })
-                print("止盈單成功(格式2): {} @{}".format(sym, tp_price))
-                tp_ok = True
-            except Exception as tp_err:
-                print("止盈掛單失敗，依賴移動止盈系統: {}".format(tp_err))
+            print("❌ 交易所止損驗證失敗，立即市價平倉保護: {}".format(sym))
+            close_position(sym, protected_qty, 'long' if side == 'buy' else 'short')
+            return
 
         trade_id="{}_{}" .format(sym.replace('/','').replace(':',''),int(time.time()))
         rec={"symbol":sym,"side":"做多" if side=='buy' else "做空","score":sig['score'],
