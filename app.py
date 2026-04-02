@@ -991,13 +991,6 @@ def check_risk_ok():
                 rs["halt_reason"] = "總資產虧損已達 {:.1f}%，停止交易".format(equity_loss_pct*100)
                 return False, rs["halt_reason"]
 
-        # 時段保護檢查
-        status, note = get_session_status()
-        if status in ("eu_closed", "us_closed"):
-            return False, "開盤保護期暫停下單：{}".format(note)
-        if status in ("eu_pause", "us_pause"):
-            return False, "開盤前暫停下單：{}".format(note)
-
         return True, "正常"
     except Exception as e:
         print("check_risk_ok 錯誤: {}".format(e))
@@ -1578,6 +1571,137 @@ def verify_protection_orders(symbol, side, sl_price, tp_price):
     }
     update_state(protection_state=dict(PROTECTION_STATE))
     return sl_ok, tp_ok
+
+
+PENDING_LEARN_IDS = set()
+
+def _parse_time_to_ms(s):
+    try:
+        return int(pd.Timestamp(str(s)).timestamp() * 1000)
+    except Exception:
+        return None
+
+def resolve_exchange_exit_fill(symbol, entry_side=None, entry_time=None):
+    """
+    嘗試從交易所最近成交中還原真正平倉價，避免 TP/SL 由交易所觸發時學習沒有記錄。
+    回傳: {exit_price, realized_pnl_usdt, fill_side, info}
+    """
+    result = {
+        'exit_price': None,
+        'realized_pnl_usdt': None,
+        'fill_side': None,
+        'info': '',
+    }
+    try:
+        close_side = 'sell' if str(entry_side or '').lower() in ('buy', 'long') else 'buy'
+        since_ms = _parse_time_to_ms(entry_time)
+        candidates = []
+
+        try:
+            trades = exchange.fetch_my_trades(symbol, since=since_ms, limit=30)
+        except Exception:
+            trades = []
+
+        for tr in trades or []:
+            raw = json.dumps(tr, ensure_ascii=False).lower()
+            side = str(tr.get('side') or '').lower()
+            if side and side != close_side:
+                continue
+            if 'open' in raw and 'close' not in raw and 'reduce' not in raw:
+                continue
+            ts = tr.get('timestamp') or 0
+            price = tr.get('price')
+            if price is None:
+                continue
+            pnl = tr.get('realizedPnl')
+            if pnl is None:
+                info = tr.get('info') or {}
+                for key in ('realizedPnl', 'achievedProfits', 'profit', 'closeProfit'):
+                    if isinstance(info, dict) and info.get(key) is not None:
+                        pnl = info.get(key)
+                        break
+            candidates.append((ts, float(price), float(pnl or 0), side, 'my_trades'))
+
+        try:
+            orders = exchange.fetch_closed_orders(symbol, since=since_ms, limit=20)
+        except Exception:
+            orders = []
+
+        for od in orders or []:
+            raw = json.dumps(od, ensure_ascii=False).lower()
+            side = str(od.get('side') or '').lower()
+            if side and side != close_side:
+                continue
+            if not any(k in raw for k in ('reduce', 'close', 'stop', 'tp', 'sl', 'profit', 'loss')):
+                continue
+            price = od.get('average') or od.get('price') or od.get('stopPrice')
+            if price is None:
+                continue
+            ts = od.get('lastTradeTimestamp') or od.get('timestamp') or 0
+            candidates.append((ts, float(price), None, side, 'closed_orders'))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0] or 0, reverse=True)
+            ts, px, pnl, side, src = candidates[0]
+            result.update({
+                'exit_price': px,
+                'realized_pnl_usdt': pnl,
+                'fill_side': side,
+                'info': src,
+            })
+    except Exception as e:
+        print('resolve_exchange_exit_fill失敗 {}: {}'.format(symbol, e))
+    return result
+
+
+def queue_learn_for_closed_symbol(sym, active_syms=None):
+    """
+    補強：不管是機器人手動平倉，還是交易所 TP/SL 觸發，只要倉位已消失就補記學習。
+    """
+    try:
+        if active_syms and sym in active_syms:
+            return False
+
+        with LEARN_LOCK:
+            open_trade = None
+            for t in reversed(LEARN_DB.get('trades', [])):
+                if t.get('symbol') == sym and t.get('result') == 'open':
+                    open_trade = t
+                    break
+            if not open_trade:
+                return False
+            trade_id = open_trade.get('id')
+            if trade_id in PENDING_LEARN_IDS:
+                return False
+
+        fill = resolve_exchange_exit_fill(sym, open_trade.get('side'), open_trade.get('entry_time'))
+        exit_price = fill.get('exit_price')
+        realized_pnl_usdt = fill.get('realized_pnl_usdt')
+
+        if exit_price is None:
+            try:
+                ticker = exchange.fetch_ticker(sym)
+                exit_price = float(ticker.get('last') or 0)
+            except Exception:
+                exit_price = 0
+
+        with LEARN_LOCK:
+            for t in LEARN_DB.get('trades', []):
+                if t.get('id') == trade_id and t.get('result') == 'open':
+                    if exit_price:
+                        t['exit_price'] = exit_price
+                    if realized_pnl_usdt is not None:
+                        t['realized_pnl_usdt'] = realized_pnl_usdt
+                    break
+            save_learn_db(LEARN_DB)
+            PENDING_LEARN_IDS.add(trade_id)
+
+        print('偵測到平倉: {}，開始學習分析... exit_price={} source={}'.format(sym, exit_price, fill.get('info') or 'ticker'))
+        threading.Thread(target=learn_from_closed_trade, args=(trade_id,), daemon=True).start()
+        return True
+    except Exception as e:
+        print('queue_learn_for_closed_symbol失敗 {}: {}'.format(sym, e))
+        return False
 
 
 
@@ -3868,22 +3992,16 @@ def position_thread():
             curr_syms={p['symbol'] for p in active}
             closed_syms=PREV_POSITION_SYMS-curr_syms
             for sym in closed_syms:
-                print("偵測到平倉: {}，開始學習分析...".format(sym))
-                with LEARN_LOCK:
-                    db=LEARN_DB; trade_id=None
-                    for t in db["trades"]:
-                        if t["symbol"]==sym and t["result"]=="open":
-                            try:
-                                ticker=exchange.fetch_ticker(sym)
-                                t["exit_price"]=ticker['last']
-                                print("平倉價格: {} @{}".format(sym, ticker['last']))
-                            except: pass
-                            trade_id=t["id"]; break
-                    if not trade_id:
-                        print("警告: {} 無學習紀錄（可能是手動下單）".format(sym))
-                if trade_id:
-                    print("啟動學習執行緒: {}".format(trade_id))
-                    threading.Thread(target=learn_from_closed_trade,args=(trade_id,),daemon=True).start()
+                if not queue_learn_for_closed_symbol(sym, curr_syms):
+                    print("警告: {} 無學習紀錄（可能是手動下單）".format(sym))
+
+            # 補償機制：避免交易所 TP/SL 已成交，但因重啟/漏輪詢沒被記錄
+            with LEARN_LOCK:
+                open_symbols = list({t.get('symbol') for t in LEARN_DB.get('trades', []) if t.get('result') == 'open' and t.get('symbol')})
+            for sym in open_symbols:
+                if sym not in curr_syms:
+                    queue_learn_for_closed_symbol(sym, curr_syms)
+
             PREV_POSITION_SYMS=curr_syms
             # 每輪備份狀態
             save_full_state()
@@ -3899,6 +4017,7 @@ def learn_from_closed_trade(trade_id):
     with LEARN_LOCK:
         trade = next((t for t in LEARN_DB["trades"] if t["id"] == trade_id), None)
     if not trade or trade["result"] != "open":
+        PENDING_LEARN_IDS.discard(trade_id)
         return
     time.sleep(5)
     try:
@@ -4034,7 +4153,9 @@ def learn_from_closed_trade(trade_id):
         update_state(risk_status=get_risk_status())
         _refresh_learn_summary()
         print("✅ 學習完成 {} | edge:{:.4f}% | lev:{:.2f}% | acct:{:.4f}% | {}".format(sym, raw_pct, leveraged_pnl_pct, learn_pnl_pct, result))
+        PENDING_LEARN_IDS.discard(trade_id)
     except Exception as e:
+        PENDING_LEARN_IDS.discard(trade_id)
         print("學習失敗: {}".format(e))
 
 def _auto_adjust_weights(db):
