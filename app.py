@@ -1334,12 +1334,17 @@ def _ai_status_from_live(stats):
 
 def _normalize_setup_mode(setup=''):
     s = str(setup or '')
-    if ('突破' in s) or ('爆發' in s) or ('news' in s.lower()) or ('breakout' in s.lower()):
+    sl = s.lower()
+    if ('突破' in s) or ('爆發' in s) or ('news' in sl) or ('breakout' in sl):
         return 'breakout'
+    if (
+        ('區間' in s) or ('震盪' in s) or ('箱體' in s) or ('均值回歸' in s)
+        or ('掃低回收' in s) or ('掃高回落' in s) or ('回補' in s)
+        or ('range' in sl) or ('mean reversion' in sl)
+    ):
+        return 'range'
     if ('回踩' in s) or ('續攻' in s) or ('延續' in s) or ('反彈續跌' in s):
         return 'trend'
-    if ('區間' in s) or ('震盪' in s) or ('range' in s.lower()):
-        return 'range'
     return 'main'
 
 def _regime_setup_fit(regime='neutral', setup=''):
@@ -1932,7 +1937,15 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             if str((t.get('breakdown') or {}).get('Regime', 'neutral') or 'neutral') == regime
             and _trade_setup_mode(t) == setup_mode
         ]
-        global_rows = list(all_rows)
+        global_rows = [t for t in all_rows if _trade_setup_mode(t) == setup_mode]
+        if regime == 'range':
+            global_rows = [t for t in global_rows if str((t.get('breakdown') or {}).get('Regime', 'neutral') or 'neutral') in ('range', 'neutral')]
+        elif regime in ('news', 'breakout'):
+            global_rows = [t for t in global_rows if str((t.get('breakdown') or {}).get('Regime', 'neutral') or 'neutral') in ('news', 'breakout', 'trend')]
+        elif regime == 'trend':
+            global_rows = [t for t in global_rows if str((t.get('breakdown') or {}).get('Regime', 'neutral') or 'neutral') in ('trend', 'neutral')]
+        if len(global_rows) < 10:
+            global_rows = list(all_rows)
 
         local_stats = _compute_stats_from_rows(local_rows)
         mid_stats = _compute_stats_from_rows(mid_rows)
@@ -2101,23 +2114,39 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     mode = str(profile.get('strategy_mode') or 'main')
 
     if phase == 'learning':
-        ai_threshold = max(40.0, base_threshold - 6.0)
-        rr_floor = max(1.05, MIN_RR_HARD_FLOOR - 0.15)
-        min_entry_quality = 1.5 if score >= ai_threshold else 2.0
+        ai_threshold = max(42.0, base_threshold - 4.0)
+        rr_floor = max(1.10, MIN_RR_HARD_FLOOR - 0.10)
+        min_entry_quality = 1.8 if score >= ai_threshold else 2.2
+        if mode == 'breakout' or regime in ('news', 'breakout'):
+            ai_threshold = max(ai_threshold, 50.0)
+            min_entry_quality = max(min_entry_quality, 2.8)
+        elif mode == 'range' and regime == 'range':
+            ai_threshold = max(46.0, ai_threshold - 1.0)
+            rr_floor = max(1.15, rr_floor)
+            min_entry_quality = max(1.7, min_entry_quality - 0.2)
     elif phase == 'semi':
         ai_threshold = max(46.0, base_threshold + float(profile.get('threshold_adjust', 0) or 0))
         rr_floor = max(1.20, MIN_RR_HARD_FLOOR)
         min_entry_quality = 2.2
-        if mode == 'breakout':
-            min_entry_quality = max(min_entry_quality, 2.6)
+        if mode == 'breakout' or regime in ('news', 'breakout'):
+            ai_threshold = max(ai_threshold, 52.0)
+            min_entry_quality = max(min_entry_quality, 2.9)
+        elif mode == 'range' and regime == 'range':
+            min_entry_quality = min(min_entry_quality, 2.0)
+            rr_floor = max(1.20, rr_floor)
     else:
         ai_threshold = max(48.0, base_threshold + float(profile.get('threshold_adjust', 0) or 0))
         rr_floor = max(1.35, MIN_RR_HARD_FLOOR)
         min_entry_quality = 2.6
-        if mode == 'breakout':
+        if mode == 'breakout' or regime in ('news', 'breakout'):
+            ai_threshold = max(ai_threshold, 54.0)
             min_entry_quality = max(min_entry_quality, 3.0)
         if regime == 'range':
-            min_entry_quality = max(min_entry_quality, 2.8)
+            if mode == 'range':
+                min_entry_quality = min(min_entry_quality, 2.1)
+                rr_floor = max(1.22, rr_floor)
+            else:
+                min_entry_quality = max(min_entry_quality, 2.8)
 
     base_ok = (
         score >= ai_threshold
@@ -5895,9 +5924,50 @@ def _detect_sweep_reclaim_trigger(d15, side):
     return False, '', 0, curr, curr, curr
 
 
+def _detect_range_reversal_trigger(d15, side):
+    c = d15['c'].astype(float); o = d15['o'].astype(float); h = d15['h'].astype(float); l = d15['l'].astype(float); v = d15['v'].astype(float)
+    curr = float(c.iloc[-1])
+    atr = max(safe_last(ta.atr(h, l, c, length=14), curr * 0.004), curr * 0.003)
+    adx_df = ta.adx(h, l, c, length=14)
+    adx = safe_last(adx_df['ADX_14'], 18) if adx_df is not None and 'ADX_14' in adx_df else 18
+    bb = ta.bbands(c, length=20, std=2.0)
+    if bb is None or bb.empty:
+        return False, '', 0, curr, curr, curr
+    bb_up = safe_last(bb.iloc[:, 0], curr)
+    bb_low = safe_last(bb.iloc[:, 2], curr)
+    bb_mid = safe_last(bb.iloc[:, 1], curr)
+    width = (bb_up - bb_low) / max(curr, 1e-9)
+    rsi = safe_last(ta.rsi(c, length=14), 50)
+    vol_now = float(v.tail(2).mean()) if len(v) >= 2 else float(v.iloc[-1])
+    vol_avg = float(v.tail(20).mean()) if len(v) >= 20 else vol_now
+    body = abs(float(c.iloc[-1]) - float(o.iloc[-1]))
+    candle_range = max(float(h.iloc[-1] - l.iloc[-1]), 1e-9)
+    close_pos = (float(c.iloc[-1]) - float(l.iloc[-1])) / candle_range
+    upper_close_pos = (float(h.iloc[-1]) - float(c.iloc[-1])) / candle_range
+    mean_rev_ok = adx <= 22 and width <= 0.028
+
+    if side > 0:
+        touched_low = curr <= bb_low * 1.01 or float(l.iloc[-1]) <= bb_low * 1.003
+        reclaim = curr >= bb_mid * 0.994 or close_pos >= 0.62
+        if mean_rev_ok and touched_low and reclaim and rsi <= 44 and body <= atr * 1.35:
+            sl = min(float(l.tail(3).min()), curr - atr * 1.15)
+            tp = max(bb_mid, curr + max(curr - sl, atr * 0.85) * 1.9)
+            quality = 7.6 + (0.5 if vol_now <= vol_avg * 1.2 else 0.0)
+            return True, '區間下緣反彈', quality, curr, sl, tp
+    else:
+        touched_up = curr >= bb_up * 0.99 or float(h.iloc[-1]) >= bb_up * 0.997
+        reclaim = curr <= bb_mid * 1.006 or upper_close_pos >= 0.62
+        if mean_rev_ok and touched_up and reclaim and rsi >= 56 and body <= atr * 1.35:
+            sl = max(float(h.tail(3).max()), curr + atr * 1.15)
+            tp = min(bb_mid, curr - max(sl - curr, atr * 0.85) * 1.9)
+            quality = 7.6 + (0.5 if vol_now <= vol_avg * 1.2 else 0.0)
+            return True, '區間上緣回落', quality, curr, sl, tp
+    return False, '', 0, curr, curr, curr
+
+
 def _best_setup_v6(d15, preferred_side):
     candidates = []
-    for fn in (_detect_pullback_trigger, _detect_squeeze_break_trigger, _detect_sweep_reclaim_trigger):
+    for fn in (_detect_pullback_trigger, _detect_squeeze_break_trigger, _detect_sweep_reclaim_trigger, _detect_range_reversal_trigger):
         ok, label, quality, entry, sl, tp = fn(d15, preferred_side)
         if ok:
             candidates.append((quality, label, entry, sl, tp))
@@ -6420,21 +6490,26 @@ def _learning_edge(symbol, regime):
         n = int(ss.get('count', 0) or 0)
         if n >= 8:
             wr = float(ss.get('win', 0) or 0) / max(n, 1)
-            if wr >= 0.60:
-                edge += 2.0
+            avg_all = float(ss.get('total_pnl', 0) or 0) / max(n, 1)
+            if wr >= 0.60 and avg_all > 0:
+                edge += 1.6
                 note = '該幣歷史較強'
-            elif wr < 0.40:
+            elif wr < 0.40 and avg_all < 0:
                 edge -= 2.5
                 note = '該幣歷史偏弱'
         with AI_LOCK:
             sr = dict((AI_DB.get('symbol_regime_stats', {}) or {}).get(f'{symbol}|{regime}', {}) or {})
         rn = int(sr.get('count', 0) or 0)
-        if rn >= 4:
+        if rn >= 6:
             rwr = float(sr.get('win', 0) or 0) / max(rn, 1)
             ravg = float(sr.get('pnl_sum', 0) or 0) / max(rn, 1)
-            edge += max(min((rwr - 0.5) * 10 + ravg * 0.2, 3.5), -3.5)
+            regime_cap = 2.0 if regime in ('news', 'breakout') else 3.0
+            edge_raw = (rwr - 0.5) * 8.0 + ravg * 0.18
+            if regime in ('news', 'breakout') and rn < 10:
+                edge_raw = min(edge_raw, 0.8)
+            edge += max(min(edge_raw, regime_cap), -regime_cap)
             if not note:
-                note = '該幣在此市場型態有統計優勢' if rwr >= 0.55 else '該幣在此市場型態需保守'
+                note = '該幣在此市場型態有統計優勢' if (rwr >= 0.55 and ravg > 0) else '該幣在此市場型態需保守'
     except Exception:
         pass
     return round(edge, 2), note
@@ -6455,9 +6530,25 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
     direction = regime_info.get('direction', '中性')
     conf = _safe_num(regime_info.get('confidence', 0.5))
     slope_dir = 1 if direction == '多' else -1 if direction == '空' else 0
+    move = _safe_num(regime_info.get('move_3bars_pct', 0))
+    volr = _safe_num(regime_info.get('vol_ratio', 1))
+    bb_width = abs(_safe_num(regime_info.get('bb_width', 0)))
+    chase_pen = abs(_safe_num(breakdown.get('追價風險', 0)))
+    setup_name = str(breakdown.get('Setup', '') or '')
+    setup_mode = _normalize_setup_mode(setup_name)
 
     score_boost = 0.0
     extra = []
+
+    # 區間盤優先轉成區間策略，避免仍以趨勢/突破邏輯處理
+    if regime == 'range' and setup_mode != 'range':
+        if side > 0:
+            breakdown['Setup'] = '區間下緣反彈'
+        else:
+            breakdown['Setup'] = '區間上緣回落'
+        setup_name = str(breakdown['Setup'])
+        setup_mode = 'range'
+        extra.append('區間盤改用均值回歸')
 
     # 1) 先看 base 分析品質
     quality_boost, quality_notes = _signal_quality_from_breakdown(breakdown, side)
@@ -6478,29 +6569,35 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
         else:
             score_boost -= 0.8
     elif regime == 'range':
-        if abs(score) >= 60 and rr >= 1.4:
-            score_boost += 0.8 * side
-            extra.append('區間強反轉')
+        if setup_mode == 'range':
+            score_boost += 2.0
+            extra.append('區間盤使用區間邏輯')
+            if rr >= 1.25:
+                score_boost += 0.8
+            if bb_width <= 0.018:
+                score_boost += 0.4
         else:
-            score_boost -= 2.6 * side
-            extra.append('區間盤降追價')
-        if abs(_safe_num(regime_info.get('bb_width', 0))) < 0.018:
-            score_boost -= 0.8 * side
+            score_boost -= 4.0
+            extra.append('區間盤不追趨勢')
+        if chase_pen >= 6:
+            score_boost -= 2.4
+            extra.append('區間盤避免追價')
     elif regime == 'news':
-        move = _safe_num(regime_info.get('move_3bars_pct', 0))
-        volr = _safe_num(regime_info.get('vol_ratio', 1))
-        if abs(score) >= 64 and rr >= 1.8:
-            score_boost += (3.5 + min(move, 4) * 0.7) * side
-            extra.append('消息盤強訊號')
+        if move >= 3.2 or volr >= 2.4 or chase_pen >= 6:
+            score_boost -= 5.5
+            extra.append('暴拉暴跌後先等回踩')
+        elif setup_mode == 'breakout' and abs(score) >= 66 and rr >= 1.9:
+            score_boost += 1.8
+            extra.append('消息盤突破但仍保守')
         else:
-            score_boost -= (4.0 + min(volr, 3.0) * 0.8) * side
+            score_boost -= 2.2
             extra.append('消息盤保守')
     else:
         if rr >= 1.7:
-            score_boost += 1.2 * side
+            score_boost += 1.2
             extra.append('中性盤留強勢')
         elif rr < 1.25:
-            score_boost -= 1.4 * side
+            score_boost -= 1.4
             extra.append('中性盤淘汰弱RR')
 
     # 3) 學習資料加權
