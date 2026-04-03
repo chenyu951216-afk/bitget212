@@ -1885,7 +1885,12 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'max_drawdown_pct': dd,
             'confidence': conf,
             'status': status,
-            'ready': status == 'valid' and conf >= 0.25 and cnt >= 50 and not sym_block,
+           'ready': (
+    not sym_block and (
+        (status == 'valid' and conf >= 0.25 and cnt >= 50) or
+        (status == 'observe' and cnt >= 35 and conf >= 0.18)
+    )
+),
             'symbol_blocked': sym_block,
         })
 
@@ -1895,9 +1900,12 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             profile['threshold_adjust'] = 999.0
             notes.append(sym_note or '幣種長期虧損封鎖')
         elif status == 'reject':
-            profile['hard_block'] = True
-            profile['threshold_adjust'] = 999.0
-            notes.append('AI淘汰策略')
+    profile['hard_block'] = False
+    profile['threshold_adjust'] = 4.5
+    notes.append('AI弱勢策略，升高門檻觀察')
+    if pf is not None:
+        notes.append(f'PF偏弱 {float(pf):.2f}')
+    notes.append(f'EV偏弱 {ev:+.4f}')
         elif status == 'warmup':
             profile['threshold_adjust'] = -6.0
             notes.append('探索模式')
@@ -6465,17 +6473,24 @@ def _enhanced_auto_learn():
     blocked_strategy_keys = set(db.setdefault('blocked_strategy_keys', []))
     blocked_symbols = set(db.setdefault('blocked_symbols', []))
 
-    # 只看最近240筆，避免越學越爛；重算而非無限累加
     combo_stats.clear(); regime_stats.clear(); symbol_regime_stats.clear()
 
     recent_closed = closed[-240:]
     for t in recent_closed:
         key = _extract_strategy_key(t)
-        metric = _trade_learn_metric(t)
-        rec = combo_stats.setdefault(key, {'count': 0, 'win': 0, 'pnl_sum': 0.0, 'pnl_list': []})
+        metric = float(_trade_learn_metric(t) or 0.0)
+        rec = combo_stats.setdefault(key, {
+            'count': 0, 'win': 0, 'loss': 0,
+            'pnl_sum': 0.0, 'pnl_list': [],
+            'gross_win': 0.0, 'gross_loss': 0.0,
+        })
         rec['count'] += 1
         if t.get('result') == 'win':
             rec['win'] += 1
+            rec['gross_win'] += max(metric, 0.0)
+        else:
+            rec['loss'] += 1
+            rec['gross_loss'] += abs(min(metric, 0.0))
         rec['pnl_sum'] += metric
         rec['pnl_list'].append(metric)
 
@@ -6498,50 +6513,61 @@ def _enhanced_auto_learn():
     new_blocked_strategy_keys = set()
     new_blocked_symbols = set()
     for key, rec in combo_stats.items():
-        if rec['count'] < 5:
+        count = int(rec.get('count', 0) or 0)
+        if count < 5:
             continue
-        wr = rec['win'] / max(rec['count'], 1)
-        avg = rec['pnl_sum'] / max(rec['count'], 1)
-        pnl_list = rec.get('pnl_list', [])
-        eq = 0.0; peak = 0.0; max_dd = 0.0
+        wins = int(rec.get('win', 0) or 0)
+        wr = wins / max(count, 1)
+        avg = float(rec.get('pnl_sum', 0.0) or 0.0) / max(count, 1)
+        pnl_list = list(rec.get('pnl_list', []) or [])
+        eq = 100.0
+        peak = 100.0
+        max_dd = 0.0
         for p in pnl_list:
-            eq += p
+            step = max(0.01, 1.0 + (float(p) / 100.0))
+            eq *= step
             peak = max(peak, eq)
             if peak > 0:
                 max_dd = max(max_dd, (peak - eq) / peak * 100.0)
-        pf_num = sum(p for p in pnl_list if p > 0)
-        pf_den = abs(sum(p for p in pnl_list if p < 0))
-        pf = (pf_num / max(pf_den, 1e-9)) if pf_den > 0 else None
-        conf = min(rec['count'] / 30.0, 1.0) * max(0.0, 1.0 - min((max_dd / 25.0), 1.0))
+        gross_win = float(rec.get('gross_win', 0.0) or 0.0)
+        gross_loss = abs(float(rec.get('gross_loss', 0.0) or 0.0))
+        pf = (gross_win / max(gross_loss, 1e-9)) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+        std = (sum((float(p) - avg) ** 2 for p in pnl_list) / max(len(pnl_list), 1)) ** 0.5
+        conf = min(count / 50.0, 1.0) * max(0.0, 1.0 - min(std / 3.0, 1.0))
 
-        # 自動封鎖虧損策略
-        if rec['count'] >= 8 and (wr < 0.40 or avg <= -0.12 or max_dd >= 18 or (pf is not None and pf < 0.95)):
+        if count >= 12 and (wr < 0.30 and avg < -0.20 and max_dd >= 25):
             new_blocked_strategy_keys.add(key)
 
-        score = (avg * 120.0 + wr * 25.0 + min(rec['count'], 30) * 0.6 - max_dd * 0.8) * max(conf, 0.15)
-        board.append({
-            'strategy': key,
-            'count': rec['count'],
-            'win_rate': round(wr * 100, 1),
-            'avg_pnl': round(avg, 2),
-            'score': round(score, 2),
-            'ev_per_trade': round(avg, 4),
-            'profit_factor': None if pf is None else round(pf, 3),
-            'max_drawdown_pct': round(max_dd, 2),
-            'confidence': round(conf, 2),
-        })
-
-        # 幣種封鎖
         sym = str(key).split('|')[-1]
-        if rec['count'] >= 10 and wr < 0.35 and avg < 0:
+        if count >= 14 and wr < 0.28 and avg < -0.25:
             new_blocked_symbols.add(sym)
 
-    board.sort(key=lambda x: (x['score'], x['confidence'], x['win_rate'], x['avg_pnl']), reverse=True)
-    db['strategy_scoreboard'] = board[:12]
+        score = (
+            avg * 35.0 +
+            ((wr * 100.0) - 50.0) * 0.6 +
+            min(pf, 3.0) * 12.0 +
+            min(count, 30) * 0.5 -
+            max_dd * 0.35 +
+            conf * 8.0
+        )
+
+        board.append({
+            'strategy': key,
+            'count': count,
+            'win_rate': round(wr * 100, 1),
+            'avg_pnl': round(avg, 4),
+            'score': round(score, 3),
+            'ev_per_trade': round(avg, 4),
+            'profit_factor': round(pf, 3),
+            'max_drawdown_pct': round(max_dd, 2),
+            'confidence': round(conf, 3),
+        })
+
+    board.sort(key=lambda x: (x['score'], x['count'], x['profit_factor'], x['win_rate']), reverse=True)
+    db['strategy_scoreboard'] = board[:20]
     db['blocked_strategy_keys'] = sorted(new_blocked_strategy_keys)
     db['blocked_symbols'] = sorted(new_blocked_symbols)
 
-    # 參數自適應，但只看最近60單，避免無限追參數
     recent = recent_closed[-60:]
     if recent:
         avg = sum(_trade_learn_metric(t) for t in recent) / len(recent)
@@ -6560,6 +6586,7 @@ def _enhanced_auto_learn():
         AI_PANEL['best_strategies'] = db.get('strategy_scoreboard', [])[:8]
         AI_PANEL['last_learning'] = db['last_learning']
         AI_PANEL['params'].update(db.get('param_sets', {}).get('neutral', {}))
+
 
 def learn_from_closed_trade(trade_id):
     _BASE_LEARN_FROM_CLOSED_TRADE(trade_id)
