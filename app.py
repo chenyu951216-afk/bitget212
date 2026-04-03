@@ -4263,20 +4263,24 @@ def learn_from_closed_trade(trade_id):
         print("學習失敗: {}".format(e))
 
 def _auto_adjust_weights(db):
-    """50筆後自動分析哪些指標最有預測力，調整權重"""
+    """50筆後 AI 真正接管權重（修正版）"""
     try:
+        global W  # ⭐ 關鍵：讓AI可以改全域權重
+
         trades = [t for t in db["trades"] if t["result"] in ("win","loss") and t.get("breakdown")]
         if len(trades) < 50:
             return
 
-        # 統計每個指標在勝利/失敗時的平均分數
         indicator_stats = {}
+
         for t in trades:
             bd = t.get("breakdown", {})
             is_win = t["result"] == "win"
+
             for key, val in bd.items():
                 if key not in indicator_stats:
                     indicator_stats[key] = {"win_sum":0,"loss_sum":0,"win_n":0,"loss_n":0}
+
                 if is_win:
                     indicator_stats[key]["win_sum"] += abs(val)
                     indicator_stats[key]["win_n"] += 1
@@ -4284,23 +4288,46 @@ def _auto_adjust_weights(db):
                     indicator_stats[key]["loss_sum"] += abs(val)
                     indicator_stats[key]["loss_n"] += 1
 
-        # 計算每個指標的「勝率貢獻度」
         contrib = {}
+
         for key, st in indicator_stats.items():
             if st["win_n"] + st["loss_n"] < 10:
                 continue
+
             win_avg = st["win_sum"] / max(st["win_n"], 1)
             loss_avg = st["loss_sum"] / max(st["loss_n"], 1)
-            # 指標在勝利時分數高於失敗時 → 有預測力
-            contrib[key] = win_avg - loss_avg
 
-        if contrib:
-            total = sum(max(v, 0.1) for v in contrib.values())
-            # 儲存貢獻度供參考
-            db["indicator_contrib"] = {k: round(v, 3) for k, v in contrib.items()}
-            print("📊 指標貢獻度更新完成，共{}個指標分析".format(len(contrib)))
+            # ⭐ 貢獻度（勝 > 敗 才加分）
+            contrib[key] = max(win_avg - loss_avg, 0.01)
+
+        if not contrib:
+            return
+
+        # ⭐ 正規化 → 變成100分權重
+        total = sum(contrib.values())
+        new_W = {}
+
+        for k, v in contrib.items():
+            new_W[k] = round(v / total * 100)
+
+        # ⭐ 補滿100（避免誤差）
+        diff = 100 - sum(new_W.values())
+        if diff != 0:
+            first_key = list(new_W.keys())[0]
+            new_W[first_key] += diff
+
+        # ⭐ 覆蓋原本權重（核心修復）
+        for k in new_W:
+            if k in W:
+                W[k] = new_W[k]
+
+        # ⭐ 存DB（保留你原本功能）
+        db["indicator_contrib"] = {k: round(v, 3) for k, v in contrib.items()}
+
+        print("🧠 AI權重已接管:", W)
+
     except Exception as e:
-        print("權重調整失敗: {}".format(e))
+        print("權重調整失敗:", e)
 
 
 
