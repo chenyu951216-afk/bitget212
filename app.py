@@ -1885,12 +1885,12 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'max_drawdown_pct': dd,
             'confidence': conf,
             'status': status,
-           'ready': (
-    not sym_block and (
-        (status == 'valid' and conf >= 0.25 and cnt >= 50) or
-        (status == 'observe' and cnt >= 35 and conf >= 0.18)
-    )
-),
+            'ready': (
+                not sym_block and (
+                    (status == 'valid' and conf >= 0.25 and cnt >= 50) or
+                    (status == 'observe' and cnt >= 35 and conf >= 0.18)
+                )
+            ),
             'symbol_blocked': sym_block,
         })
 
@@ -1900,12 +1900,12 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             profile['threshold_adjust'] = 999.0
             notes.append(sym_note or '幣種長期虧損封鎖')
         elif status == 'reject':
-    profile['hard_block'] = False
-    profile['threshold_adjust'] = 4.5
-    notes.append('AI弱勢策略，升高門檻觀察')
-    if pf is not None:
-        notes.append(f'PF偏弱 {float(pf):.2f}')
-    notes.append(f'EV偏弱 {ev:+.4f}')
+            profile['hard_block'] = False
+            profile['threshold_adjust'] = 4.5
+            notes.append('AI弱勢策略，升高門檻觀察')
+            if pf is not None:
+                notes.append(f'PF偏弱 {float(pf):.2f}')
+            notes.append(f'EV偏弱 {ev:+.4f}')
         elif status == 'warmup':
             profile['threshold_adjust'] = -6.0
             notes.append('探索模式')
@@ -1948,7 +1948,6 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
                 notes.append('區間策略')
             else:
                 notes.append('趨勢主策略')
-            # 幣種總體表現很差時提高門檻
             scnt = int(symbol_stats.get('count', 0) or 0)
             swr = float(symbol_stats.get('win_rate', 0) or 0)
             if scnt >= 8 and swr < 45:
@@ -1966,6 +1965,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
     except Exception as e:
         profile['note'] = f'AI策略讀取失敗:{str(e)[:40]}'
     return profile
+
 
 def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms, already_closing):
     symbol = str(sig.get('symbol') or '')
