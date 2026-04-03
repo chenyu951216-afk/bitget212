@@ -1371,6 +1371,48 @@ def _trend_learning_profile(symbol='', regime='neutral', setup=''):
         'source': source, 'note': note,
     }
 
+def _ui_trend_payload(symbol='', regime='neutral', setup=''):
+    try:
+        prof = _trend_learning_profile(symbol=symbol, regime=regime, setup=setup)
+        stage = str(prof.get('stage') or 'learning')
+        hold_bias = float(prof.get('hold_bias', 0.0) or 0.0)
+        cont_rate = float(prof.get('continuation_rate', 0.0) or 0.0)
+        count = int(prof.get('count', 0) or 0)
+        intervene_ratio = float(prof.get('intervene_ratio', 0.0) or 0.0)
+        if stage == 'learning':
+            confidence = min(44.0, 18.0 + count * 0.8 + cont_rate * 18.0)
+        elif stage == 'semi':
+            confidence = min(79.0, 45.0 + max(hold_bias, 0.0) * 22.0 + cont_rate * 20.0 + intervene_ratio * 8.0)
+        else:
+            confidence = min(96.0, 55.0 + max(hold_bias, 0.0) * 26.0 + cont_rate * 24.0 + intervene_ratio * 10.0)
+        hold_reason = 'trend_continuation' if hold_bias > 0 and stage in ('semi', 'full') else 'normal_manage'
+        mode_label = {'learning': 'learning', 'semi': 'partial', 'full': 'full'}.get(stage, 'learning')
+        return {
+            'trend_mode': mode_label,
+            'hold_reason': hold_reason,
+            'trend_confidence': round(max(0.0, min(confidence, 99.0)), 1),
+            'trend_learning_count': count,
+            'trend_continuation_rate': round(cont_rate * 100.0, 1),
+            'trend_hold_bias': round(hold_bias, 4),
+            'trend_note': str(prof.get('note') or ''),
+            'trend_source': str(prof.get('source') or 'none'),
+            'trend_avg_run_pct': float(prof.get('avg_run_pct', 0.0) or 0.0),
+            'trend_avg_pullback_pct': float(prof.get('avg_pullback_pct', 0.0) or 0.0),
+        }
+    except Exception as e:
+        return {
+            'trend_mode': 'learning',
+            'hold_reason': 'normal_manage',
+            'trend_confidence': 0.0,
+            'trend_learning_count': 0,
+            'trend_continuation_rate': 0.0,
+            'trend_hold_bias': 0.0,
+            'trend_note': f'趨勢資料錯誤: {e}',
+            'trend_source': 'error',
+            'trend_avg_run_pct': 0.0,
+            'trend_avg_pullback_pct': 0.0,
+        }
+
 def _live_trade_stats(symbol=None, regime=None):
     rows = get_live_trades(closed_only=True)
     if symbol:
@@ -7467,6 +7509,32 @@ def api_state_enhanced():
             payload['auto_backtest'] = dict(AUTO_BACKTEST_STATE)
         if 'learn_summary' not in payload:
             payload['learn_summary'] = dict(STATE.get('learn_summary', {}))
+        payload['trend_dashboard'] = _ui_trend_payload()
+        top_signals = []
+        for s in list(payload.get('top_signals', []) or []):
+            try:
+                row = dict(s)
+                bd = dict(row.get('breakdown') or {})
+                regime = str(bd.get('Regime', payload.get('market_info', {}).get('pattern', 'neutral')) or 'neutral')
+                row.update(_ui_trend_payload(symbol=row.get('symbol', ''), regime=regime, setup=row.get('setup_label') or bd.get('Setup', '')))
+                top_signals.append(row)
+            except Exception:
+                top_signals.append(s)
+        if top_signals:
+            payload['top_signals'] = top_signals
+        active_positions = []
+        for p in list(payload.get('active_positions', []) or []):
+            try:
+                row = dict(p)
+                sym = str(row.get('symbol') or '')
+                sig = dict(SIGNAL_META_CACHE.get(sym) or {})
+                regime = str(sig.get('regime') or ((AI_PANEL.get('symbol_regimes', {}) or {}).get(sym, {}) or {}).get('regime') or payload.get('market_info', {}).get('pattern', 'neutral') or 'neutral')
+                row.update(_ui_trend_payload(symbol=sym, regime=regime, setup=sig.get('setup_label') or ''))
+                active_positions.append(row)
+            except Exception:
+                active_positions.append(p)
+        if active_positions:
+            payload['active_positions'] = active_positions
         return jsonify(payload)
     except Exception as e:
         payload['api_state_fix_error'] = str(e)
