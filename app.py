@@ -38,11 +38,11 @@ exchange.enableRateLimit = True
 PANIC_API_KEY   = os.getenv('PANIC_API_KEY', 'cde101d65a00a418e451ae0118ed0835275781e1')
 OPENAI_API_KEY  = os.getenv('OPENAI_API_KEY', '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')
 ANTHROPIC_KEY   = os.getenv('ANTHROPIC_API_KEY', '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')
-ORDER_THRESHOLD         = 50   # 預設門檻 50
-ORDER_THRESHOLD_DEFAULT = 50   # 預設值
-ORDER_THRESHOLD_HIGH    = 55   # 持續滿倉後提高到 55
-ORDER_THRESHOLD_DROP    = 1    # 每 3 輪無新單下降 1 分
-ORDER_THRESHOLD_FLOOR   = 48   # 最低只降到 48
+ORDER_THRESHOLD         = 55   # 預設門檻 55
+ORDER_THRESHOLD_DEFAULT = 55   # 預設值
+ORDER_THRESHOLD_HIGH    = 70   # 持續滿倉後提高到 70
+ORDER_THRESHOLD_DROP    = 2    # 每 3 輪無新單下降 2 分
+ORDER_THRESHOLD_FLOOR   = 52   # 最低只降到 52
 
 # =====================================================
 # 核心交易參數
