@@ -1840,8 +1840,9 @@ def _normalize_wr_percent(value):
 
 
 
+
 def _ai_strategy_profile(symbol, regime='neutral', setup=''):
-    """v34: 真 AI 接管。回測只做候選，接管只吃實單。"""
+    """v35: 真 AI 接管 + 三層回退。回測只做候選，接管只吃實單。"""
     strategy_key = f'{regime}|{setup}|{symbol}'
     setup_mode = _normalize_setup_mode(setup)
     profile = {
@@ -1862,9 +1863,102 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
         'status': 'warmup',
         'symbol_blocked': False,
     }
+
+    def _trade_setup_mode(trade):
+        try:
+            bd = dict(trade.get('breakdown') or {})
+            raw = str(
+                trade.get('setup_label')
+                or bd.get('Setup')
+                or trade.get('setup')
+                or ''
+            )
+            return _normalize_setup_mode(raw)
+        except Exception:
+            return 'main'
+
+    def _compute_stats_from_rows(rows):
+        if not rows:
+            return {
+                "count": 0, "win_rate": 0.0, "avg_pnl": 0.0, "ev_per_trade": 0.0,
+                "profit_factor": None, "max_drawdown_pct": None, "std_pnl": None
+            }
+        pnls = [_trade_learn_metric(t) for t in rows]
+        wins = [p for p in pnls if p > 0]
+        losses = [abs(p) for p in pnls if p < 0]
+        cnt = len(pnls)
+        wr = (len(wins) / max(cnt, 1)) * 100.0
+        avg = sum(pnls) / max(cnt, 1)
+        pf = (sum(wins) / max(sum(losses), 1e-9)) if losses else (999.0 if wins else None)
+
+        equity = 100.0
+        peak = 100.0
+        max_dd = 0.0
+        for p in pnls:
+            step = max(0.01, 1.0 + (float(p) / 100.0))
+            equity *= step
+            peak = max(peak, equity)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - equity) / peak * 100.0)
+        max_dd = min(max_dd, 100.0)
+
+        mean = avg
+        std = (sum((p - mean) ** 2 for p in pnls) / max(cnt, 1)) ** 0.5
+        return {
+            "count": cnt,
+            "win_rate": round(wr, 2),
+            "avg_pnl": round(avg, 4),
+            "ev_per_trade": round(avg, 4),
+            "profit_factor": None if pf is None else round(float(pf), 3),
+            "max_drawdown_pct": round(float(max_dd), 3),
+            "std_pnl": round(float(std), 4),
+        }
+
     try:
-        stats = _live_trade_stats(symbol=symbol, regime=regime)
+        all_rows = get_live_trades(closed_only=True)
+        symbol = str(symbol or '')
+        regime = str(regime or 'neutral')
+        fit_ok, fit_note = _regime_setup_fit(regime, setup)
+        sym_block, sym_note = _symbol_hard_block(symbol)
+
+        local_rows = [
+            t for t in all_rows
+            if str(t.get('symbol') or '') == symbol
+            and str((t.get('breakdown') or {}).get('Regime', 'neutral') or 'neutral') == regime
+            and _trade_setup_mode(t) == setup_mode
+        ]
+        mid_rows = [
+            t for t in all_rows
+            if str((t.get('breakdown') or {}).get('Regime', 'neutral') or 'neutral') == regime
+            and _trade_setup_mode(t) == setup_mode
+        ]
+        global_rows = list(all_rows)
+
+        local_stats = _compute_stats_from_rows(local_rows)
+        mid_stats = _compute_stats_from_rows(mid_rows)
+        global_stats = _compute_stats_from_rows(global_rows)
         symbol_stats = _live_trade_stats(symbol=symbol, regime=None)
+
+        local_cnt = int(local_stats.get('count', 0) or 0)
+        mid_cnt = int(mid_stats.get('count', 0) or 0)
+        global_cnt = int(global_stats.get('count', 0) or 0)
+
+        if local_cnt >= 8:
+            stats = local_stats
+            fallback_level = 'local'
+            fallback_desc = '局部'
+            fallback_detail = f'{symbol}|{regime}|{setup_mode}'
+        elif mid_cnt >= 12:
+            stats = mid_stats
+            fallback_level = 'mid'
+            fallback_desc = '中層'
+            fallback_detail = f'{regime}|{setup_mode}'
+        else:
+            stats = global_stats
+            fallback_level = 'global'
+            fallback_desc = '全域'
+            fallback_detail = 'live_all'
+
         cnt = int(stats.get('count', 0) or 0)
         wr = float(stats.get('win_rate', 0) or 0)
         avg = float(stats.get('avg_pnl', 0) or 0)
@@ -1873,8 +1967,6 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
         dd = stats.get('max_drawdown_pct', None)
         conf = _ai_confidence_from_live(stats)
         status = _ai_status_from_live(stats)
-        fit_ok, fit_note = _regime_setup_fit(regime, setup)
-        sym_block, sym_note = _symbol_hard_block(symbol)
 
         profile.update({
             'sample_count': cnt,
@@ -1885,6 +1977,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'max_drawdown_pct': dd,
             'confidence': conf,
             'status': status,
+            'source': f'live_only:{fallback_level}',
             'ready': (
                 not sym_block and (
                     (status == 'valid' and conf >= 0.25 and cnt >= 50) or
@@ -1894,7 +1987,9 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'symbol_blocked': sym_block,
         })
 
-        notes = []
+        notes = [f'三層回退:{fallback_desc}', f'依據:{fallback_detail}']
+        notes.append(f'局部{local_cnt}｜中層{mid_cnt}｜全域{global_cnt}')
+
         if sym_block:
             profile['hard_block'] = True
             profile['threshold_adjust'] = 999.0
@@ -1907,12 +2002,21 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
                 notes.append(f'PF偏弱 {float(pf):.2f}')
             notes.append(f'EV偏弱 {ev:+.4f}')
         elif status == 'warmup':
-            profile['threshold_adjust'] = -6.0
+            profile['threshold_adjust'] = -6.0 if fallback_level != 'global' else -2.5
             notes.append('探索模式')
             notes.append(f'樣本 {cnt}/20')
-            notes.append('前20單優先累積實單')
+            if fallback_level == 'global':
+                notes.append('局部不足，暫借全域經驗')
+            elif fallback_level == 'mid':
+                notes.append('局部不足，暫借中層經驗')
+            else:
+                notes.append('前20單優先累積實單')
         elif status == 'observe':
             profile['threshold_adjust'] = -1.5 if fit_ok else 1.0
+            if fallback_level == 'global':
+                profile['threshold_adjust'] += 1.0
+            elif fallback_level == 'mid':
+                profile['threshold_adjust'] += 0.5
             notes.append('半接管模式')
             notes.append(f'樣本 {cnt}/50')
             if not fit_ok:
@@ -1935,6 +2039,14 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
                 th_adj += 2.0
             elif dd is not None and dd <= 3:
                 th_adj -= 0.5
+            if fallback_level == 'global':
+                th_adj += 1.5
+                notes.append('全域回退，保守過濾')
+            elif fallback_level == 'mid':
+                th_adj += 0.5
+                notes.append('中層回退')
+            else:
+                notes.append('局部接管')
             if not fit_ok:
                 th_adj += 2.5
                 notes.append(fit_note)
@@ -1965,7 +2077,6 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
     except Exception as e:
         profile['note'] = f'AI策略讀取失敗:{str(e)[:40]}'
     return profile
-
 
 def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms, already_closing):
     symbol = str(sig.get('symbol') or '')
