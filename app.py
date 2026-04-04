@@ -70,6 +70,10 @@ TREND_AI_FULL_TRADES = 50       # 趨勢學習 50 筆後全介入
 AI_MIN_SAMPLE_EFFECT = 5        # AI/參數學習至少 5 筆才開始影響決策
 SYMBOL_BLOCK_MIN_TRADES = 11    # 同幣實單超過 10 筆才啟用封鎖
 SYMBOL_BLOCK_MIN_WINRATE = 40.0 # 同幣勝率低於 40% 停止再下
+STRATEGY_CAPITAL_MIN_TRADES = 5  # 策略資金放大至少要 5 筆以上
+STRATEGY_BLOCK_MIN_TRADES = 11   # 策略封鎖至少要 11 筆以上
+STRATEGY_BLOCK_MIN_WINRATE = 45.0# 策略勝率低於 45% 停止再下
+NEUTRAL_REGIME_BLOCK = True      # 中性盤預設不主動開新單
 TREND_LEARNING_RESET_FROM = "2026-04-04 00:00:00"  # 趨勢學習從這之後的實單重新開始
 TREND_EARLY_EXIT_MIN_RUN = 1.20 # 平倉後若後續延續超過此幅度，視為可能太早出場
 TREND_EARLY_EXIT_MIN_EDGE = 0.35# 平倉後先回踩不超過這個比例，才算健康回踩後延續
@@ -90,6 +94,80 @@ STORAGE = BotStorage(
     legacy_learn_json=LEGACY_LEARN_DB_PATH,
     legacy_backtest_json=LEGACY_BACKTEST_DB_PATH,
 )
+
+
+def _ensure_sqlite_compat_schema():
+    """補齊 API 會用到的欄位，避免 schema 落差讓查詢直接炸掉。"""
+    import sqlite3
+    table_columns = {
+        'learning_trades': {
+            'updated_at': "TEXT DEFAULT ''",
+            'created_at': "TEXT DEFAULT ''",
+            'data_json': "TEXT DEFAULT '{}'",
+        },
+        'trade_history': {
+            'updated_at': "TEXT DEFAULT ''",
+            'created_at': "TEXT DEFAULT ''",
+            'entry_time': "TEXT DEFAULT ''",
+            'exit_time': "TEXT DEFAULT ''",
+            'time': "TEXT DEFAULT ''",
+            'data_json': "TEXT DEFAULT '{}'",
+        },
+        'risk_events': {
+            'created_at': "TEXT DEFAULT ''",
+            'event_time': "TEXT DEFAULT ''",
+            'timestamp': "TEXT DEFAULT ''",
+            'payload_json': "TEXT DEFAULT '{}'",
+        },
+        'audit_logs': {
+            'created_at': "TEXT DEFAULT ''",
+            'event_time': "TEXT DEFAULT ''",
+            'timestamp': "TEXT DEFAULT ''",
+            'payload_json': "TEXT DEFAULT '{}'",
+        },
+        'backtest_runs': {
+            'created_at': "TEXT DEFAULT ''",
+            'run_time': "TEXT DEFAULT ''",
+            'timestamp': "TEXT DEFAULT ''",
+            'payload_json': "TEXT DEFAULT '{}'",
+            'summary_json': "TEXT DEFAULT '{}'",
+            'result_json': "TEXT DEFAULT '{}'",
+            'data_json': "TEXT DEFAULT '{}'",
+        },
+    }
+    try:
+        os.makedirs(os.path.dirname(SQLITE_DB_PATH), exist_ok=True)
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        try:
+            cur = conn.cursor()
+            for table, columns in table_columns.items():
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+                exists = cur.fetchone()
+                if not exists:
+                    cols_sql = []
+                    if table == 'learning_trades':
+                        cols_sql.append('trade_id TEXT PRIMARY KEY')
+                    elif table in ('trade_history', 'backtest_runs'):
+                        cols_sql.append('id INTEGER PRIMARY KEY AUTOINCREMENT')
+                    else:
+                        cols_sql.append('id INTEGER PRIMARY KEY AUTOINCREMENT')
+                    for name, spec in columns.items():
+                        cols_sql.append(f"{name} {spec}")
+                    cur.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(cols_sql)})")
+                    continue
+                cur.execute(f"PRAGMA table_info({table})")
+                existing = {str(r[1]) for r in cur.fetchall()}
+                for name, spec in columns.items():
+                    if name not in existing:
+                        cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print('SQLite schema 修復失敗:', e)
+
+
+_ensure_sqlite_compat_schema()
 
 # =====================================================
 # 防連損設定
@@ -1534,6 +1612,153 @@ def _symbol_hard_block(symbol=''):
         return True, '該幣實單超過10筆且勝率低於40%，封鎖幣種'
     return False, ''
 
+
+def _strategy_live_rows(symbol='', regime='neutral', setup=''):
+    setup_mode = _normalize_setup_mode(setup)
+    rows = []
+    for t in get_live_trades(closed_only=True):
+        if str(t.get('symbol') or '') != str(symbol):
+            continue
+        bd = dict(t.get('breakdown') or {})
+        t_regime = str(bd.get('Regime', 'neutral') or 'neutral')
+        t_setup = _normalize_setup_mode(t.get('setup_label') or bd.get('Setup') or t.get('setup') or '')
+        if t_regime == str(regime or 'neutral') and t_setup == setup_mode:
+            rows.append(t)
+    return rows
+
+
+def _strategy_hard_block(symbol='', regime='neutral', setup=''):
+    rows = _strategy_live_rows(symbol=symbol, regime=regime, setup=setup)
+    cnt = len(rows)
+    if cnt < STRATEGY_BLOCK_MIN_TRADES:
+        return False, ''
+    wins = sum(1 for t in rows if t.get('result') == 'win')
+    wr = wins / max(cnt, 1) * 100.0
+    if wr < STRATEGY_BLOCK_MIN_WINRATE:
+        return True, f'該策略實單超過10筆且勝率低於{int(STRATEGY_BLOCK_MIN_WINRATE)}%，封鎖策略'
+    return False, ''
+
+
+def _strategy_score_lookup(symbol='', regime='neutral', setup=''):
+    setup_mode = _normalize_setup_mode(setup)
+    wanted = f'{regime}|{setup}|{symbol}'
+    best = None
+    try:
+        with AI_LOCK:
+            board = list(AI_DB.get('strategy_scoreboard', []) or [])
+            bt_rows = list((AUTO_BACKTEST_STATE.get('results') or []))
+        for row in board:
+            if str(row.get('strategy') or '') == wanted:
+                best = dict(row)
+                best['source'] = 'live_exact'
+                return best
+            if str(row.get('strategy') or '').endswith(f'|{symbol}') and str(row.get('strategy_mode') or 'main') == setup_mode:
+                best = dict(row)
+                best['source'] = 'live_mode'
+        if best:
+            return best
+        for row in bt_rows:
+            if str(row.get('symbol') or '') != str(symbol):
+                continue
+            row_mode = str(row.get('strategy_mode') or 'main')
+            row_regime = str(row.get('market_regime') or 'neutral')
+            if row_mode == setup_mode and row_regime == str(regime or 'neutral'):
+                out = dict(row)
+                out['count'] = int(row.get('trades', 0) or 0)
+                out['source'] = 'backtest_exact'
+                return out
+        for row in bt_rows:
+            if str(row.get('symbol') or '') == str(symbol) and str(row.get('strategy_mode') or 'main') == setup_mode:
+                out = dict(row)
+                out['count'] = int(row.get('trades', 0) or 0)
+                out['source'] = 'backtest_mode'
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def _strategy_margin_multiplier(symbol='', regime='neutral', setup=''):
+    row = _strategy_score_lookup(symbol=symbol, regime=regime, setup=setup)
+    count = int(row.get('count', row.get('trades', 0)) or 0)
+    if count < STRATEGY_CAPITAL_MIN_TRADES:
+        return 1.0, '策略樣本不足'
+    ev = float(row.get('ev_per_trade', 0) or 0)
+    wr = float(row.get('win_rate', 0) or 0)
+    dd = float(row.get('max_drawdown_pct', 0) or 0)
+    mult = 1.0
+    note = '策略資金中性'
+    if ev >= 0.05 and wr >= 55 and dd <= 12:
+        mult = 1.18 if count < 10 else 1.28
+        note = '策略資金放大'
+    elif ev < 0 or wr < 45:
+        mult = 0.72 if count >= 8 else 0.85
+        note = '策略資金縮小'
+    return round(clamp(mult, 0.65, 1.35), 4), note
+
+
+def _entry_quality_feedback(symbol='', regime='neutral', setup='', entry_quality=0):
+    try:
+        with AI_LOCK:
+            eq_db = dict((AI_DB.get('entry_quality_feedback', {}) or {}))
+        bin_key = 'hq' if float(entry_quality or 0) >= 7 else 'mq' if float(entry_quality or 0) >= 5 else 'lq'
+        lookup_keys = [
+            f'{symbol}|{regime}|{_normalize_setup_mode(setup)}|{bin_key}',
+            f'{symbol}|{regime}|all|{bin_key}',
+            f'all|{regime}|{_normalize_setup_mode(setup)}|{bin_key}',
+        ]
+        for key in lookup_keys:
+            rec = dict(eq_db.get(key) or {})
+            count = int(rec.get('count', 0) or 0)
+            if count < AI_MIN_SAMPLE_EFFECT:
+                continue
+            loss_rate = float(rec.get('loss_rate', 0) or 0)
+            avg = float(rec.get('avg_pnl', 0) or 0)
+            if loss_rate >= 0.6 and avg < 0:
+                return -2.5, '高品質訊號近期失真'
+            if loss_rate <= 0.35 and avg > 0:
+                return 1.2, '進場品質回饋佳'
+    except Exception:
+        pass
+    return 0.0, ''
+
+
+def _ai_risk_multiplier(symbol='', regime='neutral', setup='', score=0, breakdown=None):
+    profile = _ai_strategy_profile(symbol, regime=regime, setup=setup)
+    confidence = float(profile.get('confidence', 0) or 0)
+    ev = float(profile.get('ev_per_trade', 0) or 0)
+    wr = float(profile.get('win_rate', 0) or 0)
+    mult = 1.0
+    note = 'AI風控中性'
+    if bool(profile.get('hard_block')):
+        return 0.55, 'AI風控封鎖縮倉'
+    if confidence < 0.5:
+        mult *= 0.75
+        note = 'AI信心不足縮倉'
+    if ev > 0.05 and wr >= 55 and confidence >= 0.55:
+        mult *= 1.08
+        note = 'AI信心佳微放大'
+    elif ev < 0 or wr < 45:
+        mult *= 0.78
+        note = 'AI弱勢縮倉'
+    if NEUTRAL_REGIME_BLOCK and str(regime or 'neutral') == 'neutral':
+        mult *= 0.82
+    return round(clamp(mult, 0.5, 1.2), 4), note
+
+
+def _missed_move_feedback(trade):
+    try:
+        missed = float(trade.get('missed_move_pct', 0) or 0)
+        pnl = float(_trade_learn_metric(trade) or 0)
+        if missed > 2.0 and pnl >= 0:
+            return 'stretch'
+        if missed < 0.5 and pnl < 0:
+            return 'tighten'
+    except Exception:
+        pass
+    return ''
+
+
 def _ai_warmup_mode():
     return len(get_live_trades(closed_only=True)) < 20
 
@@ -2173,6 +2398,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
         regime = str(regime or 'neutral')
         fit_ok, fit_note = _regime_setup_fit(regime, setup)
         sym_block, sym_note = _symbol_hard_block(symbol)
+        strat_block, strat_note = _strategy_hard_block(symbol, regime, setup)
 
         local_rows = [
             t for t in all_rows
@@ -2229,6 +2455,9 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
         conf = _ai_confidence_from_live(stats)
         status = _ai_status_from_live(stats)
 
+        source_weight = {'local': 1.0, 'mid': 0.7, 'global': 0.4}.get(fallback_level, 0.4)
+        conf = round(conf * source_weight, 3)
+
         profile.update({
             'sample_count': cnt,
             'win_rate': wr,
@@ -2246,6 +2475,8 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
                 )
             ),
             'symbol_blocked': sym_block,
+            'strategy_blocked': strat_block,
+            'source_weight': source_weight,
         })
 
         notes = [f'三層回退:{fallback_desc}', f'依據:{fallback_detail}']
@@ -2255,6 +2486,10 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             profile['hard_block'] = True
             profile['threshold_adjust'] = 999.0
             notes.append(sym_note or '幣種長期虧損封鎖')
+        elif strat_block:
+            profile['hard_block'] = True
+            profile['threshold_adjust'] = 999.0
+            notes.append(strat_note or '策略長期偏弱封鎖')
         elif status == 'reject':
             profile['hard_block'] = False
             profile['threshold_adjust'] = 4.5
@@ -2397,7 +2632,11 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
                 min_entry_quality = max(min_entry_quality, 2.8)
 
     rotation_adj, rotation_notes = _symbol_rotation_adjustment(symbol)
-    effective_score = score + rotation_adj
+    eq_adj, eq_note = _entry_quality_feedback(symbol, regime, setup, eq)
+    ai_score_adj = float(profile.get('ev_per_trade', 0) or 0) * 20.0
+    ai_score_adj += (float(profile.get('win_rate', 0) or 0) - 50.0) * 0.04
+    ai_score_adj += eq_adj
+    effective_score = score + rotation_adj + ai_score_adj
 
     base_ok = (
         effective_score >= ai_threshold
@@ -2431,6 +2670,9 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         if bool(profile.get('symbol_blocked')):
             ai_ok = False
             reasons.append('幣種長期虧損封鎖')
+        elif bool(profile.get('strategy_blocked')):
+            ai_ok = False
+            reasons.append('策略長期虧損封鎖')
         elif int(profile.get('sample_count', 0) or 0) >= TREND_AI_SEMI_TRADES and float(profile.get('avg_pnl', 0) or 0) <= 0 and float(profile.get('win_rate', 0) or 0) < 45:
             ai_ok = False
             reasons.append('半接管封鎖虧損策略')
@@ -2443,6 +2685,9 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             reasons.append(str(profile.get('note')))
     else:
         hard_block = bool(profile.get('hard_block'))
+        if NEUTRAL_REGIME_BLOCK and regime == 'neutral':
+            hard_block = True
+            reasons.append('中性盤禁新單')
         if not fit_ok:
             hard_block = True
             reasons.append(fit_note)
@@ -2458,6 +2703,10 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             reasons.append('AI樣本{}'.format(profile.get('sample_count', 0)))
         if profile.get('note'):
             reasons.append(str(profile.get('note')))
+
+    if eq_note:
+        reasons.append(eq_note)
+    reasons.append('AI分數調整 {:+.2f}'.format(ai_score_adj))
 
     if not base_ok:
         if effective_score < ai_threshold:
@@ -4911,11 +5160,19 @@ def infer_margin_context(sig, same_side_count=0):
             market_dir=market_dir,
             market_strength=market_strength,
         )
+        regime = str(breakdown.get('Regime', 'neutral') or 'neutral')
+        setup = str(sig.get('setup_label') or breakdown.get('Setup', '') or '')
         learning_mult = get_margin_learning_multiplier(sig.get('symbol', ''), sig.get('score', 0), breakdown)
-        margin_pct = round(clamp(margin_pct * learning_mult, MIN_MARGIN_PCT, MAX_MARGIN_PCT), 4)
+        strategy_mult, strategy_note = _strategy_margin_multiplier(sig.get('symbol', ''), regime, setup)
+        ai_risk_mult, ai_risk_note = _ai_risk_multiplier(sig.get('symbol', ''), regime, setup, sig.get('score', 0), breakdown)
+        margin_pct = round(clamp(margin_pct * learning_mult * strategy_mult * ai_risk_mult, MIN_MARGIN_PCT, MAX_MARGIN_PCT), 4)
         return {
             'margin_pct': margin_pct,
             'learning_mult': learning_mult,
+            'strategy_mult': strategy_mult,
+            'ai_risk_mult': ai_risk_mult,
+            'strategy_note': strategy_note,
+            'ai_risk_note': ai_risk_note,
             'atr_ratio': round(atr_ratio, 5),
             'trend_aligned': trend_aligned,
             'squeeze_ready': squeeze_ready,
@@ -6969,9 +7226,29 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
         if learn_note:
             extra.append(learn_note)
 
+    eq_value = float(breakdown.get('進場品質', 0) or 0)
+    eq_boost, eq_note = _entry_quality_feedback(symbol, regime, setup_name, eq_value)
+    if eq_boost:
+        score_boost += eq_boost * side
+        if eq_note:
+            extra.append(eq_note)
+
+    strat_row = _strategy_score_lookup(symbol, regime, setup_name)
+
     # 4) 依市場型態覆蓋風控參數，但 TP 仍由 AI 學到的 RR 來決定
     new_sl_mult = float(params.get('sl_mult', sl_mult or 2.0))
     regime_rr_target = float(rr or max(float(tp_mult or 3.5) / max(float(sl_mult or 2.0), 1e-9), MIN_RR_HARD_FLOOR))
+    strat_trades = int(strat_row.get('count', strat_row.get('trades', 0)) or 0)
+    if strat_trades >= STRATEGY_CAPITAL_MIN_TRADES:
+        strat_ev = float(strat_row.get('ev_per_trade', 0) or 0)
+        strat_wr = float(strat_row.get('win_rate', 0) or 0)
+        if strat_ev > 0.04 and strat_wr >= 55:
+            regime_rr_target = min(max(regime_rr_target * 1.06, 1.25), 3.9)
+            extra.append('策略優勢放大利潤目標')
+        elif strat_ev < 0 or strat_wr < 45:
+            regime_rr_target = min(max(regime_rr_target * 0.94, 1.15), 3.4)
+            new_sl_mult = min(max(new_sl_mult * 0.96, 1.2), 3.0)
+            extra.append('策略偏弱縮短目標')
     if regime == 'news' and conf >= 0.8:
         new_sl_mult = max(new_sl_mult, 2.4)
         regime_rr_target = min(max(regime_rr_target, 1.8), 3.8)
@@ -7044,10 +7321,11 @@ def _enhanced_auto_learn():
     combo_stats = db.setdefault('combo_stats', {})
     regime_stats = db.setdefault('regime_stats', {})
     symbol_regime_stats = db.setdefault('symbol_regime_stats', {})
+    entry_quality_feedback = db.setdefault('entry_quality_feedback', {})
     blocked_strategy_keys = set(db.setdefault('blocked_strategy_keys', []))
     blocked_symbols = set(db.setdefault('blocked_symbols', []))
 
-    combo_stats.clear(); regime_stats.clear(); symbol_regime_stats.clear()
+    combo_stats.clear(); regime_stats.clear(); symbol_regime_stats.clear(); entry_quality_feedback.clear()
 
     recent_closed = closed[-240:]
     for t in recent_closed:
@@ -7082,6 +7360,16 @@ def _enhanced_auto_learn():
         if t.get('result') == 'win':
             sr['win'] += 1
         sr['pnl_sum'] += metric
+
+        setup_mode = _normalize_setup_mode((t.get('breakdown') or {}).get('Setup') or t.get('setup_label') or '')
+        eq_val = float((t.get('breakdown') or {}).get('進場品質', 0) or 0)
+        eq_bin = 'hq' if eq_val >= 7 else 'mq' if eq_val >= 5 else 'lq'
+        for eq_key in (f'{sym}|{regime}|{setup_mode}|{eq_bin}', f'{sym}|{regime}|all|{eq_bin}', f'all|{regime}|{setup_mode}|{eq_bin}'):
+            rec_eq = entry_quality_feedback.setdefault(eq_key, {'count': 0, 'loss': 0, 'pnl_sum': 0.0})
+            rec_eq['count'] += 1
+            rec_eq['pnl_sum'] += metric
+            if t.get('result') == 'loss':
+                rec_eq['loss'] += 1
 
     board = []
     new_blocked_strategy_keys = set()
@@ -7137,6 +7425,12 @@ def _enhanced_auto_learn():
             'confidence': round(conf, 3),
         })
 
+    for key, rec in list(entry_quality_feedback.items()):
+        count = int(rec.get('count', 0) or 0)
+        avg = float(rec.get('pnl_sum', 0) or 0.0) / max(count, 1)
+        rec['avg_pnl'] = round(avg, 4)
+        rec['loss_rate'] = round(float(rec.get('loss', 0) or 0) / max(count, 1), 4)
+
     board.sort(key=lambda x: (x['score'], x['count'], x['profit_factor'], x['win_rate']), reverse=True)
     db['strategy_scoreboard'] = board[:20]
     db['blocked_strategy_keys'] = sorted(new_blocked_strategy_keys)
@@ -7146,6 +7440,8 @@ def _enhanced_auto_learn():
     if recent:
         avg = sum(_trade_learn_metric(t) for t in recent) / len(recent)
         wr = sum(1 for t in recent if t.get('result') == 'win') / len(recent)
+        miss_stretch = sum(1 for t in recent if _missed_move_feedback(t) == 'stretch')
+        miss_tighten = sum(1 for t in recent if _missed_move_feedback(t) == 'tighten')
         for regime, p in db.get('param_sets', {}).items():
             if wr >= 0.60 and avg > 0:
                 p['tp_mult'] = round(min(float(p.get('tp_mult', 3.0)) * 1.02, 5.2), 2)
@@ -7153,6 +7449,12 @@ def _enhanced_auto_learn():
             elif wr < 0.45:
                 p['sl_mult'] = round(min(float(p.get('sl_mult', 2.0)) * 1.02, 3.0), 2)
                 p['tp_mult'] = round(max(float(p.get('tp_mult', 3.0)) * 0.98, 2.0), 2)
+            if miss_stretch >= 5:
+                p['tp_mult'] = round(min(float(p.get('tp_mult', 3.0)) * 1.03, 5.4), 2)
+                p['trail_trigger_atr'] = round(min(float(p.get('trail_trigger_atr', 1.4)) * 1.04, 2.8), 2)
+            elif miss_tighten >= 5:
+                p['tp_mult'] = round(max(float(p.get('tp_mult', 3.0)) * 0.985, 2.0), 2)
+                p['sl_mult'] = round(max(float(p.get('sl_mult', 2.0)) * 0.99, 1.2), 2)
 
     db['last_learning'] = tw_now_str('%Y-%m-%d %H:%M:%S')
     save_ai_db(db)
@@ -7603,6 +7905,29 @@ def _sqlite_fetch_dicts(query, params=()):
         conn.close()
 
 
+def _sqlite_table_columns(table_name):
+    import sqlite3
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        return [str(r[1]) for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def _sqlite_order_clause(table_name, preferred_cols, fallback='rowid DESC'):
+    cols = set(_sqlite_table_columns(table_name))
+    usable = [c for c in preferred_cols if c in cols]
+    if not usable:
+        return fallback
+    expr = ', '.join([f"CASE WHEN {c} IS NULL OR {c}='' THEN 1 ELSE 0 END" for c in usable])
+    expr += ', ' + ', '.join([f'{c} DESC' for c in usable])
+    return expr
+
+
 @app.route('/api/ai_full_learning')
 def api_ai_full_learning():
     """完整學習資料，預設最近50筆，避免一次撈太大造成卡頓。"""
@@ -7610,11 +7935,12 @@ def api_ai_full_learning():
     offset = _api_offset(default=0, max_value=5000)
     rows, error = [], None
     try:
+        order_clause = _sqlite_order_clause('learning_trades', ['updated_at', 'created_at', 'exit_time', 'entry_time'])
         rows = _sqlite_fetch_dicts(
-            """
+            f"""
             SELECT trade_id, symbol, result, source, entry_time, exit_time, created_at, updated_at, data_json
             FROM learning_trades
-            ORDER BY COALESCE(updated_at, created_at, exit_time, entry_time) DESC
+            ORDER BY {order_clause}
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -7637,11 +7963,12 @@ def api_trade_history_records():
     offset = _api_offset(default=0, max_value=5000)
     rows, error = [], None
     try:
+        order_clause = _sqlite_order_clause('trade_history', ['updated_at', 'created_at', 'exit_time', 'entry_time', 'time'])
         rows = _sqlite_fetch_dicts(
-            """
+            f"""
             SELECT *
             FROM trade_history
-            ORDER BY COALESCE(updated_at, created_at, exit_time, entry_time, time) DESC
+            ORDER BY {order_clause}
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -7665,11 +7992,12 @@ def api_risk_logs():
     offset = _api_offset(default=0, max_value=5000)
     rows, error = [], None
     try:
+        order_clause = _sqlite_order_clause('risk_events', ['created_at', 'event_time', 'timestamp'])
         rows = _sqlite_fetch_dicts(
-            """
+            f"""
             SELECT *
             FROM risk_events
-            ORDER BY COALESCE(created_at, event_time, timestamp) DESC
+            ORDER BY {order_clause}
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -7693,11 +8021,12 @@ def api_audit_logs():
     offset = _api_offset(default=0, max_value=5000)
     rows, error = [], None
     try:
+        order_clause = _sqlite_order_clause('audit_logs', ['created_at', 'event_time', 'timestamp'])
         rows = _sqlite_fetch_dicts(
-            """
+            f"""
             SELECT *
             FROM audit_logs
-            ORDER BY COALESCE(created_at, event_time, timestamp) DESC
+            ORDER BY {order_clause}
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -7721,11 +8050,12 @@ def api_backtest_runs():
     offset = _api_offset(default=0, max_value=2000)
     rows, error = [], None
     try:
+        order_clause = _sqlite_order_clause('backtest_runs', ['created_at', 'run_time', 'timestamp'])
         rows = _sqlite_fetch_dicts(
-            """
+            f"""
             SELECT *
             FROM backtest_runs
-            ORDER BY COALESCE(created_at, run_time, timestamp) DESC
+            ORDER BY {order_clause}
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
