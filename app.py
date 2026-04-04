@@ -6021,7 +6021,7 @@ def scan_thread():
                             'decision': dict(AUTO_ORDER_AUDIT[best['symbol']]),
                             'gating': dict(ai_decision.get('gating') or {}),
                             'decision_calibrator': dict(ai_decision.get('decision_calibrator') or {}),
-                            'position_formula': dict(margin_ctx),
+                            'position_formula': dict((best.get('margin_ctx') or {})),
                             'dataset_meta': _dataset_meta(),
                             'learn_version': 'v16_replay_inputs',
                         })
