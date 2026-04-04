@@ -6,6 +6,14 @@ import pandas_ta as ta
 from flask import Flask, render_template, jsonify, request
 from datetime import datetime
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from bot_runtime_utils import atomic_json_load, atomic_json_save, prune_mapping, safe_request_json, safe_request_text, snapshot_mapping
+from bot_market_guard import MarketDirectionGuard
+import bot_news_disabled
+
 app = Flask(__name__)
 
 # =====================================================
@@ -68,6 +76,12 @@ SCORE_CACHE         = {}        # 分數平滑快取
 ENTRY_LOCKS         = {}        # 進場鎖，避免 90→30 反覆觸發
 PROTECTION_STATE    = {}        # 交易所保護單驗證狀態
 AUTO_ORDER_AUDIT    = {}        # 記錄每輪為何沒下單
+CACHE_LOCK          = threading.RLock()
+PROTECTION_LOCK     = threading.RLock()
+AUDIT_LOCK          = threading.RLock()
+MARKET_DIRECTION_GUARD = MarketDirectionGuard(required_confirmations=2, ttl_seconds=4 * 3600)
+FVG_MONITOR_CACHE   = {}
+FVG_MONITOR_LOCK    = threading.RLock()
 
 # =====================================================
 # 防連損設定
@@ -100,80 +114,54 @@ _DT_LOCK = threading.Lock()
 def update_dynamic_threshold(top_sigs=None):
     """
     動態門檻循環（每輪掃描結束呼叫）：
-    預設50
-    → 滿倉連續5輪 → 升到55
-    → 50門檻下空倉連續5輪 → 回到50
-    → 有空位且1小時無新單 → 每小時降5（最低48）
-    → 下單後回到50
+    預設 60
+    → 連續滿倉 5 輪 → 升到 80
+    → 在 80 門檻下連續 5 輪有空位 → 回到 60
+    → 有空位且連續 3 輪無新單 → 每輪降 2，最低 55
+    → 新下單後回到 60
     """
     global ORDER_THRESHOLD
     with _DT_LOCK:
-        dt  = _DT
-        now = datetime.now()
-
+        dt = _DT
         with STATE_LOCK:
-            pos_count = len(STATE["active_positions"])
-            sigs = top_sigs or STATE.get("top_signals", [])
-
-        is_full   = pos_count >= MAX_OPEN_POSITIONS
-        has_space = pos_count < MAX_OPEN_POSITIONS
-
-        # ── 情況A：滿倉 → 計算連續滿倉輪數 ──
+            pos_count = len(STATE.get("active_positions", []))
+        is_full = pos_count >= MAX_OPEN_POSITIONS
         if is_full:
-            dt["full_rounds"]  += 1
-            dt["empty_rounds"]  = 0
-            dt["no_order_rounds"] = 0  # 滿倉重置無單計數
-
-            # 滿倉5輪後升到55
+            dt["full_rounds"] += 1
+            dt["empty_rounds"] = 0
+            dt["no_order_rounds"] = 0
             if dt["full_rounds"] >= 5 and dt["current"] < ORDER_THRESHOLD_HIGH:
                 dt["current"] = ORDER_THRESHOLD_HIGH
                 ORDER_THRESHOLD = ORDER_THRESHOLD_HIGH
-                print("📈 門檻升至55（連續滿倉{}輪）".format(dt["full_rounds"]))
-                update_state(threshold_info={
-                    "current": ORDER_THRESHOLD_HIGH,
-                    "phase": "嚴格（持續滿倉）",
-                    "full_rounds": dt["full_rounds"]
-                })
+                print("📈 門檻升至{}（連續滿倉{}輪）".format(ORDER_THRESHOLD_HIGH, dt["full_rounds"]))
+                update_state(threshold_info={"current": ORDER_THRESHOLD_HIGH, "phase": "嚴格（持續滿倉）", "full_rounds": dt["full_rounds"]})
             return
-
-        # ── 有空位 ──
-        dt["full_rounds"] = 0  # 重置滿倉計數
-
-        # ── 情況B：門檻55，空倉連續5輪 → 回到50 ──
+        dt["full_rounds"] = 0
         if dt["current"] >= ORDER_THRESHOLD_HIGH:
             dt["empty_rounds"] += 1
             if dt["empty_rounds"] >= 5:
-                dt["current"]      = ORDER_THRESHOLD_DEFAULT
-                ORDER_THRESHOLD    = ORDER_THRESHOLD_DEFAULT
+                rolled = dt["empty_rounds"]
+                dt["current"] = ORDER_THRESHOLD_DEFAULT
+                ORDER_THRESHOLD = ORDER_THRESHOLD_DEFAULT
                 dt["empty_rounds"] = 0
-                print("📉 門檻回到50（50門檻下空倉{}輪）".format(dt["empty_rounds"]))
-                update_state(threshold_info={
-                    "current": ORDER_THRESHOLD_DEFAULT,
-                    "phase": "預設",
-                    "empty_rounds": dt["empty_rounds"]
-                })
+                print("📉 門檻回到{}（高門檻下有空位{}輪）".format(ORDER_THRESHOLD_DEFAULT, rolled))
+                update_state(threshold_info={"current": ORDER_THRESHOLD_DEFAULT, "phase": "預設", "empty_rounds": rolled})
             else:
-                print("⏱ 門檻55空倉中 {}/5 輪".format(dt["empty_rounds"]))
+                print("⏱ 門檻{}有空位中 {}/5 輪".format(ORDER_THRESHOLD_HIGH, dt["empty_rounds"]))
             return
-        else:
-            dt["empty_rounds"] = 0
-
-        # ── 情況C：門檻55時有空倉，每3輪降5，降到38為止 ──
+        dt["empty_rounds"] = 0
         if dt["current"] > ORDER_THRESHOLD_FLOOR:
             dt["no_order_rounds"] = dt.get("no_order_rounds", 0) + 1
             print("⏱ 門檻{}空倉計數: {}/3 輪".format(dt["current"], dt["no_order_rounds"]))
             if dt["no_order_rounds"] >= 3:
                 new_val = max(dt["current"] - ORDER_THRESHOLD_DROP, ORDER_THRESHOLD_FLOOR)
-                dt["current"]         = new_val
-                ORDER_THRESHOLD       = new_val
-                dt["no_order_rounds"] = 0  # 重置計數，繼續每3輪降5
+                dt["current"] = new_val
+                ORDER_THRESHOLD = new_val
+                dt["no_order_rounds"] = 0
                 print("⬇️ 門檻降至{}（空倉持續3輪）".format(new_val))
-                update_state(threshold_info={
-                    "current": new_val,
-                    "phase": "預設" if new_val <= ORDER_THRESHOLD_FLOOR else "降溫中",
-                })
+                update_state(threshold_info={"current": new_val, "phase": "預設" if new_val <= ORDER_THRESHOLD_FLOOR else "降溫中"})
         else:
-            dt["no_order_rounds"] = 0  # 已在最低48，重置
+            dt["no_order_rounds"] = 0
 
 def record_order_placed():
     """下單後呼叫，重置計時並回到預設60"""
@@ -697,7 +685,7 @@ def market_analysis_thread():
                 print("📊 大盤分析: {} | {} | BTC {:.0f} ({:+.1f}%)".format(
                     result["pattern"], result["direction"],
                     result["btc_price"], result["btc_change"]))
-                # 自動管理長期倉位
+                # 大盤分析與長期倉位判斷分離，需經方向確認後才會切換
                 check_long_term_position()
         except Exception as e:
             print("大盤分析執行緒錯誤: {}".format(e))
@@ -765,8 +753,8 @@ def cancel_fvg_order(symbol, reason=""):
 def fvg_order_monitor_thread():
     """
     FVG 限價掛單追蹤執行緒（每30秒檢查一次）
-    - 掛單已成交 → 登出，正常追蹤止盈止損
-    - 分數反轉或跌破支撐/突破壓力 → 取消掛單
+    - 掛單狀態、ticker 固定檢查
+    - analyze(symbol) 只在價格接近失效區或快取過期時重跑
     - 掛單超過4小時未成交 → 取消
     """
     print("FVG掛單追蹤執行緒啟動")
@@ -774,91 +762,79 @@ def fvg_order_monitor_thread():
         try:
             with FVG_LOCK:
                 syms = list(FVG_ORDERS.keys())
-
             for symbol in syms:
                 try:
                     with FVG_LOCK:
                         if symbol not in FVG_ORDERS:
                             continue
-                        order = FVG_ORDERS[symbol]
-
-                    # 查詢掛單狀態
-                    try:
-                        od = exchange.fetch_order(order["order_id"], symbol)
-                        status = od.get("status", "")
-                    except:
-                        status = "unknown"
-
-                    # 已成交 → 登出
-                    if status in ("closed", "filled"):
-                        with FVG_LOCK:
-                            FVG_ORDERS.pop(symbol, None)
-                        print("✅ FVG掛單成交: {} @{}".format(symbol, order["price"]))
-                        update_state(fvg_orders=dict(FVG_ORDERS))
-                        continue
-
-                    # 已取消 → 清除
-                    if status == "canceled":
-                        with FVG_LOCK:
-                            FVG_ORDERS.pop(symbol, None)
-                        update_state(fvg_orders=dict(FVG_ORDERS))
-                        continue
-
-                    # 抓當前價格做判斷
-                    ticker = exchange.fetch_ticker(symbol)
-                    curr   = float(ticker['last'])
-
-                    # 重新分析分數（看是否反轉）
-                    sc = extract_analysis_score(analyze(symbol))
-
-                    cancel_reason = None
-
-                    # 分數低於30或反轉 → 取消
-                    if order["side"] == "long" and sc < 30:
-                        cancel_reason = "做多分數不足{}（<30），取消掛單".format(round(sc,1))
-                    elif order["side"] == "short" and sc > -30:
-                        cancel_reason = "做空分數不足{}（>-30），取消掛單".format(round(sc,1))
-
-                    # 跌破支撐（做多掛單）→ 取消
-                    elif order["side"] == "long" and order["support"] > 0:
-                        if curr < order["support"] * 0.998:
-                            cancel_reason = "跌破支撐{:.4f}，取消做多掛單".format(order["support"])
-
-                    # 突破壓力（做空掛單）→ 取消
-                    elif order["side"] == "short" and order["resist"] > 0:
-                        if curr > order["resist"] * 1.002:
-                            cancel_reason = "突破壓力{:.4f}，取消做空掛單".format(order["resist"])
-
-                    # 超過4小時 → 取消
-                    placed = order.get("placed_time", "")
-                    if placed:
+                        order = dict(FVG_ORDERS[symbol])
+                    with FVG_MONITOR_LOCK:
+                        cache = FVG_MONITOR_CACHE.setdefault(symbol, {})
+                    now_ts = time.time()
+                    status = str(cache.get('order_status') or 'unknown')
+                    if now_ts - float(cache.get('order_status_ts', 0) or 0) >= 20:
                         try:
-                            # 簡單判斷：掛單超過240分鐘
-                            h_now = int(tw_now_str("%H")) * 60 + int(tw_now_str("%M"))
-                            h_placed = int(placed[:2]) * 60 + int(placed[3:5])
-                            diff = (h_now - h_placed) % (24*60)
-                            if diff > 240:
-                                cancel_reason = "掛單超過4小時，自動取消"
-                        except:
+                            od = exchange.fetch_order(order['order_id'], symbol)
+                            status = od.get('status', '')
+                            with FVG_MONITOR_LOCK:
+                                cache['order_status'] = status
+                                cache['order_status_ts'] = now_ts
+                        except Exception:
                             pass
-
+                    if status in ('closed', 'filled'):
+                        with FVG_LOCK:
+                            FVG_ORDERS.pop(symbol, None)
+                        print("✅ FVG掛單成交: {} @{}".format(symbol, order['price']))
+                        update_state(fvg_orders=dict(FVG_ORDERS))
+                        continue
+                    if status == 'canceled':
+                        with FVG_LOCK:
+                            FVG_ORDERS.pop(symbol, None)
+                        update_state(fvg_orders=dict(FVG_ORDERS))
+                        continue
+                    ticker = exchange.fetch_ticker(symbol)
+                    curr = float(ticker['last'])
+                    support = float(order.get('support', 0) or 0)
+                    resist = float(order.get('resist', 0) or 0)
+                    near_boundary = False
+                    if order['side'] == 'long' and support > 0:
+                        near_boundary = curr <= support * 1.003
+                    elif order['side'] == 'short' and resist > 0:
+                        near_boundary = curr >= resist * 0.997
+                    sc = float(order.get('score', 0) or 0)
+                    if near_boundary or (now_ts - float(cache.get('analysis_ts', 0) or 0) >= 180):
+                        sc = extract_analysis_score(analyze(symbol))
+                        with FVG_MONITOR_LOCK:
+                            cache['analysis_score'] = sc
+                            cache['analysis_ts'] = now_ts
+                    else:
+                        sc = float(cache.get('analysis_score', sc) or sc)
+                    cancel_reason = None
+                    if order['side'] == 'long' and sc < 30:
+                        cancel_reason = '做多分數不足{}（<30），取消掛單'.format(round(sc, 1))
+                    elif order['side'] == 'short' and sc > -30:
+                        cancel_reason = '做空分數不足{}（>-30），取消掛單'.format(round(sc, 1))
+                    elif order['side'] == 'long' and support > 0 and curr < support * 0.998:
+                        cancel_reason = '跌破支撐{:.4f}，取消做多掛單'.format(support)
+                    elif order['side'] == 'short' and resist > 0 and curr > resist * 1.002:
+                        cancel_reason = '突破壓力{:.4f}，取消做空掛單'.format(resist)
+                    created_ts = float(order.get('created_ts', now_ts) or now_ts)
+                    if not cancel_reason and (now_ts - created_ts) > 240 * 60:
+                        cancel_reason = '掛單超過4小時，自動取消'
                     if cancel_reason:
                         cancel_fvg_order(symbol, cancel_reason)
                     else:
-                        # 更新狀態顯示
                         with FVG_LOCK:
                             if symbol in FVG_ORDERS:
-                                FVG_ORDERS[symbol]["curr_price"] = round(curr, 6)
-                                FVG_ORDERS[symbol]["curr_score"] = round(sc, 1)
-                                FVG_ORDERS[symbol]["status"] = "掛單中 | 現價{:.4f} | 分數{}".format(curr, round(sc,1))
+                                FVG_ORDERS[symbol]['curr_price'] = round(curr, 6)
+                                FVG_ORDERS[symbol]['curr_score'] = round(sc, 1)
+                                FVG_ORDERS[symbol]['status'] = '掛單中 | 現價{:.4f} | 分數{}'.format(curr, round(sc,1))
                         update_state(fvg_orders=dict(FVG_ORDERS))
-
                 except Exception as e:
-                    print("FVG追蹤{}錯誤: {}".format(symbol, e))
-
+                    print('FVG追蹤{}錯誤: {}'.format(symbol, e))
         except Exception as e:
-            print("FVG追蹤執行緒錯誤: {}".format(e))
-        time.sleep(30)  # 每30秒檢查一次
+            print('FVG追蹤執行緒錯誤: {}'.format(e))
+        time.sleep(30)
 
 def open_long_term_position(direction, reason=""):
     """開長期倉位（BTC，低槓桿5x，5%資產）"""
@@ -934,34 +910,29 @@ def close_long_term_position(reason=""):
         return False
 
 def check_long_term_position():
-    """每小時由大盤分析執行緒呼叫，根據大盤方向管理長期倉位"""
+    """每小時由大盤分析執行緒呼叫，根據大盤方向管理長期倉位。需連續 2 次同方向才動作，降低耦合。"""
     with MARKET_LOCK:
-        direction  = MARKET_STATE.get("direction", "中性")
-        strength   = MARKET_STATE.get("strength", 0)
-        pattern    = MARKET_STATE.get("pattern", "")
+        direction = MARKET_STATE.get("direction", "中性")
+        strength = MARKET_STATE.get("strength", 0)
+        pattern = MARKET_STATE.get("pattern", "")
         prediction = MARKET_STATE.get("prediction", "")
-
     with LT_LOCK:
         curr_pos = LT_STATE["position"]
-
-    # 強度不夠不動
     if strength < 0.6:
         print("⏸ 大盤強度不足({:.1f})，長期倉位維持現狀".format(strength))
         return
-
-    # 強多 → 開多/維持多
+    confirmed, confirm_count = MARKET_DIRECTION_GUARD.register(direction)
+    if direction in ("強多", "多", "強空", "空") and not confirmed:
+        print("⏳ 大盤方向 {} 第 {} 次確認，長期倉位暫不切換".format(direction, confirm_count))
+        return
     if direction in ("強多", "多") and curr_pos != "long":
         if curr_pos == "short":
             close_long_term_position("方向轉多，平空倉")
         open_long_term_position("long", "{} | {}".format(pattern, prediction[:30]))
-
-    # 強空 → 開空/維持空
     elif direction in ("強空", "空") and curr_pos != "short":
         if curr_pos == "long":
             close_long_term_position("方向轉空，平多倉")
         open_long_term_position("short", "{} | {}".format(pattern, prediction[:30]))
-
-    # 中性 → 平倉觀望
     elif direction == "中性" and curr_pos is not None:
         close_long_term_position("大盤中性，觀望")
 
@@ -1102,49 +1073,6 @@ def _manual_release_risk_state():
 # =====================================================
 
 
-def _position_drawdown_pct(pos):
-    try:
-        entry = float(pos.get('entryPrice',0) or 0)
-        mark = float(pos.get('markPrice',0) or 0)
-        side = str(pos.get('side','') or '').lower()
-        if entry <= 0 or mark <= 0:
-            return 0.0
-        if side == 'long':
-            return round(max((entry - mark) / entry * 100.0, 0.0), 2)
-        return round(max((mark - entry) / entry * 100.0, 0.0), 2)
-    except Exception:
-        return 0.0
-
-
-def _position_leveraged_pnl_pct(pos):
-    try:
-        p = pos.get('percentage', None)
-        if p is not None:
-            return round(float(p or 0), 2)
-    except Exception:
-        pass
-    try:
-        dd = _position_drawdown_pct(pos)
-        lev = float(pos.get('leverage',1) or 1)
-        side = str(pos.get('side','') or '').lower()
-        entry = float(pos.get('entryPrice',0) or 0)
-        mark = float(pos.get('markPrice',0) or 0)
-        favorable = (mark >= entry) if side == 'long' else (mark <= entry)
-        signed = dd * lev
-        return round(signed if favorable else -signed, 2)
-    except Exception:
-        return 0.0
-
-
-def _manual_release_risk_state():
-    with RISK_LOCK:
-        RISK_STATE['trading_halted'] = False
-        RISK_STATE['halt_reason'] = ''
-        RISK_STATE['cooldown_until'] = None
-        RISK_STATE['consecutive_loss'] = 0
-    update_state(risk_status=get_risk_status())
-    return {'ok': True, 'message': '已手動解除風控暫停'}
-
 # =====================================================
 # 評分權重 - 同類指標共享總分預算，有幾個就除幾個
 # =====================================================
@@ -1187,18 +1115,17 @@ if _total != 100:
 assert sum(W.values()) == 100, "權重總和{}不等於100".format(sum(W.values()))
 
 # 新聞單獨計分
-NEWS_WEIGHT = W.get("news", 2)
+NEWS_WEIGHT = 0  # 新聞系統已停用，不再納入分數
 
 
 # =====================================================
 # 學習資料庫
 # =====================================================
 def load_learn_db():
-    try:
-        with open(LEARN_DB_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return {
+    data = atomic_json_load(LEARN_DB_PATH, None)
+    if data is not None:
+        return data
+    return {
             "trades": [],
             "pattern_stats": {},
             "symbol_stats": {},     # 每個幣的勝率統計
@@ -1210,27 +1137,17 @@ def load_learn_db():
 
 def save_learn_db(db):
     try:
-        dir1 = os.path.dirname(LEARN_DB_PATH)
-        if dir1: os.makedirs(dir1, exist_ok=True)
-        with open(LEARN_DB_PATH, 'w', encoding='utf-8') as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
+        atomic_json_save(LEARN_DB_PATH, db, ensure_ascii=False, indent=2)
     except Exception as e:
         print("學習DB儲存失敗: {}".format(e))
 
 
 def load_backtest_db():
-    try:
-        with open(BACKTEST_DB_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {"runs": [], "summary": {}, "latest": {}}
+    return atomic_json_load(BACKTEST_DB_PATH, {"runs": [], "summary": {}, "latest": {}})
 
 def save_backtest_db(db):
     try:
-        dir1 = os.path.dirname(BACKTEST_DB_PATH)
-        if dir1: os.makedirs(dir1, exist_ok=True)
-        with open(BACKTEST_DB_PATH, 'w', encoding='utf-8') as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
+        atomic_json_save(BACKTEST_DB_PATH, db, ensure_ascii=False, indent=2)
     except Exception as e:
         print("回測DB儲存失敗: {}".format(e))
 
@@ -1602,28 +1519,24 @@ def load_full_state():
 def save_risk_state():
     """備份風控狀態"""
     try:
-        dir3 = os.path.dirname(RISK_STATE_PATH)
-        if dir3: os.makedirs(dir3, exist_ok=True)
-        with open(RISK_STATE_PATH, 'w', encoding='utf-8') as f:
-            json.dump({
-                "today_date": RISK_STATE.get("today_date", ""),
-                "daily_loss_usdt": RISK_STATE.get("daily_loss_usdt", 0),
-                "consecutive_loss": RISK_STATE.get("consecutive_loss", 0),
-                "trading_halted": RISK_STATE.get("trading_halted", False),
-                "halt_reason": RISK_STATE.get("halt_reason", ""),
-                "timestamp": datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
+        atomic_json_save(RISK_STATE_PATH, {
+            "today_date": RISK_STATE.get("today_date", ""),
+            "daily_loss_usdt": RISK_STATE.get("daily_loss_usdt", 0),
+            "consecutive_loss": RISK_STATE.get("consecutive_loss", 0),
+            "trading_halted": RISK_STATE.get("trading_halted", False),
+            "halt_reason": RISK_STATE.get("halt_reason", ""),
+            "timestamp": datetime.now().isoformat()
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         print("風控備份失敗: {}".format(e))
 
 def load_risk_state():
     """從硬碟恢復風控狀態"""
     try:
-        if not os.path.exists(RISK_STATE_PATH):
+        backup = atomic_json_load(RISK_STATE_PATH, None)
+        if not backup:
             print("⚠️ 無風控備份，從頭開始")
             return
-        with open(RISK_STATE_PATH, 'r', encoding='utf-8') as f:
-            backup = json.load(f)
         # 只恢復今天的資料
         today = tw_today()
         if backup.get("today_date") == today:
@@ -1726,8 +1639,8 @@ save_learn_db(LEARN_DB)
 # =====================================================
 STATE = {
     "news_score":        0,
-    "latest_news_title": "等待新聞...",
-    "news_sentiment":    "初始化中",
+    "latest_news_title": "新聞系統已停用",
+    "news_sentiment":    "已停用",
     "top_signals":       [],
     "active_positions":  [],
     "scan_progress":     "啟動中，約需 2 分鐘完成首輪掃描...",
@@ -1743,7 +1656,7 @@ STATE = {
     "market_info":       {"pattern":"初始化中","direction":"中性","btc_price":0,"prediction":""},
     "lt_info":           {"position":None,"entry_price":0,"pnl":0,"pattern":"","prediction":""},
     "fvg_orders":        {},
-    "threshold_info":    {"current": 48, "phase": "預設"},  # 動態門檻資訊
+    "threshold_info":    {"current": 60, "phase": "預設"},  # 動態門檻資訊
     "auto_order_audit":  {},
     "protection_state":  {},
     "learn_summary": {
@@ -1762,13 +1675,15 @@ STATE_LOCK = threading.Lock()
 def update_state(**kwargs):
     with STATE_LOCK:
         STATE.update(kwargs)
+        return dict(STATE)
 
 def smooth_signal_score(symbol, raw_score):
-    prev = SCORE_CACHE.get(symbol, raw_score)
-    stable = prev * (1 - SCORE_SMOOTH_ALPHA) + raw_score * SCORE_SMOOTH_ALPHA
-    if abs(raw_score) >= 70 and abs(prev) < 45:
-        stable = prev * 0.55 + raw_score * 0.45
-    SCORE_CACHE[symbol] = stable
+    with CACHE_LOCK:
+        prev = SCORE_CACHE.get(symbol, raw_score)
+        stable = prev * (1 - SCORE_SMOOTH_ALPHA) + raw_score * SCORE_SMOOTH_ALPHA
+        if abs(raw_score) >= 70 and abs(prev) < 45:
+            stable = prev * 0.55 + raw_score * 0.45
+        SCORE_CACHE[symbol] = stable
     return round(stable, 2)
 
 def score_jump_alert(symbol, raw_score, stable_score):
@@ -1779,11 +1694,13 @@ def score_jump_alert(symbol, raw_score, stable_score):
     return ''
 
 def can_reenter_symbol(symbol):
-    ts = ENTRY_LOCKS.get(symbol, 0)
+    with CACHE_LOCK:
+        ts = ENTRY_LOCKS.get(symbol, 0)
     return (time.time() - ts) >= ENTRY_LOCK_SEC
 
 def touch_entry_lock(symbol):
-    ENTRY_LOCKS[symbol] = time.time()
+    with CACHE_LOCK:
+        ENTRY_LOCKS[symbol] = time.time()
 
 def fetch_real_atr(symbol, timeframe='15m', limit=60):
     try:
@@ -1803,27 +1720,34 @@ def verify_protection_orders(symbol, side, sl_price, tp_price):
     except Exception as e:
         print('查詢保護單失敗 {}: {}'.format(symbol, e))
         orders = []
+    try:
+        positions = exchange.fetch_positions([symbol])
+    except Exception:
+        positions = []
     sl_ok = False
     tp_ok = False
+    has_position = any(abs(float((p or {}).get('contracts', 0) or 0)) > 0 for p in (positions or []))
     sl_keys = ['stop', 'stoploss', 'loss', 'sl']
     tp_keys = ['takeprofit', 'profit', 'tp']
     for o in orders:
-        text = json.dumps(o, ensure_ascii=False).lower()
-        if not sl_ok and any(k in text for k in sl_keys):
+        text_dump = json.dumps(o, ensure_ascii=False).lower()
+        if not sl_ok and any(k in text_dump for k in sl_keys):
             sl_ok = True
-        if not tp_ok and any(k in text for k in tp_keys):
+        if not tp_ok and any(k in text_dump for k in tp_keys):
             tp_ok = True
-    PROTECTION_STATE[symbol] = {
-        'sl_ok': sl_ok,
-        'tp_ok': tp_ok,
-        'sl': round(float(sl_price or 0), 8),
-        'tp': round(float(tp_price or 0), 8),
-        'side': side,
-        'updated_at': tw_now_str(),
-    }
-    update_state(protection_state=dict(PROTECTION_STATE))
+    with PROTECTION_LOCK:
+        PROTECTION_STATE[symbol] = {
+            'sl_ok': sl_ok,
+            'tp_ok': tp_ok,
+            'has_position': has_position,
+            'sl': round(float(sl_price or 0), 8),
+            'tp': round(float(tp_price or 0), 8),
+            'side': side,
+            'updated_at': tw_now_str(),
+        }
+        snap = snapshot_mapping(PROTECTION_STATE)
+    update_state(protection_state=snap)
     return sl_ok, tp_ok
-
 
 def ensure_exchange_protection(sym, side, pos_side, qty, sl_price, tp_price, verify_wait_sec=1.0):
     """下主單後立即補掛交易所保護單；若止損驗證失敗，回傳 sl_ok=False。"""
@@ -1833,12 +1757,14 @@ def ensure_exchange_protection(sym, side, pos_side, qty, sl_price, tp_price, ver
     tp_ok = False
 
     if qty <= 0:
-        PROTECTION_STATE[sym] = {
-            'sl_ok': False, 'tp_ok': False, 'sl': round(float(sl_price or 0), 8),
-            'tp': round(float(tp_price or 0), 8), 'side': (side or '').lower(),
-            'updated_at': tw_now_str(), 'note': 'qty<=0，未掛保護單'
-        }
-        update_state(protection_state=dict(PROTECTION_STATE))
+        with PROTECTION_LOCK:
+            PROTECTION_STATE[sym] = {
+                'sl_ok': False, 'tp_ok': False, 'sl': round(float(sl_price or 0), 8),
+                'tp': round(float(tp_price or 0), 8), 'side': (side or '').lower(),
+                'updated_at': tw_now_str(), 'note': 'qty<=0，未掛保護單'
+            }
+            snap = snapshot_mapping(PROTECTION_STATE)
+        update_state(protection_state=snap)
         return False, False
 
     # 止損單（三種格式依序嘗試）
@@ -1916,16 +1842,18 @@ def ensure_exchange_protection(sym, side, pos_side, qty, sl_price, tp_price, ver
     v_sl_ok, v_tp_ok = verify_protection_orders(sym, side, sl_price, tp_price)
     sl_ok = bool(sl_ok or v_sl_ok)
     tp_ok = bool(tp_ok or v_tp_ok)
-    PROTECTION_STATE[sym] = {
-        'sl_ok': sl_ok,
-        'tp_ok': tp_ok,
-        'sl': round(float(sl_price or 0), 8),
-        'tp': round(float(tp_price or 0), 8),
-        'side': (side or '').lower(),
-        'updated_at': tw_now_str(),
-        'note': '交易所止損已驗證' if sl_ok else '交易所止損驗證失敗',
-    }
-    update_state(protection_state=dict(PROTECTION_STATE))
+    with PROTECTION_LOCK:
+        PROTECTION_STATE[sym] = {
+            'sl_ok': sl_ok,
+            'tp_ok': tp_ok,
+            'sl': round(float(sl_price or 0), 8),
+            'tp': round(float(tp_price or 0), 8),
+            'side': (side or '').lower(),
+            'updated_at': tw_now_str(),
+            'note': '交易所止損已驗證' if sl_ok else '交易所止損驗證失敗',
+        }
+        snap = snapshot_mapping(PROTECTION_STATE)
+    update_state(protection_state=snap)
     return sl_ok, tp_ok
 
 
@@ -3985,13 +3913,7 @@ def analyze(symbol):
 # =====================================================
 # 新聞執行緒
 # =====================================================
-NEWS_CACHE = {
-    "score": 0,
-    "sentiment": "中性 ➡️",
-    "summary": "",
-    "latest_title": "",
-    "updated_at": 0,
-}
+NEWS_CACHE = bot_news_disabled.disabled_news_state()
 NEWS_LOCK = threading.Lock()
 
 def get_cached_news_score():
@@ -4002,154 +3924,20 @@ def set_cached_news(score, sentiment, summary, latest_title):
     with NEWS_LOCK:
         NEWS_CACHE.update({
             "score": int(max(min(score, 5), -5)),
-            "sentiment": sentiment or "中性 ➡️",
+            "sentiment": sentiment or "已停用",
             "summary": summary or "",
-            "latest_title": latest_title or "",
+            "latest_title": latest_title or "新聞系統已停用",
             "updated_at": time.time(),
         })
 
 def fetch_crypto_news():
-    """從多個來源抓取加密貨幣和宏觀經濟新聞"""
-    news_list = []
-    
-    # 來源1: Binance BTC 即時價格（判斷市場情緒基礎）
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT", timeout=8)
-        d = r.json()
-        pct = float(d.get('priceChangePercent', 0))
-        price = float(d.get('lastPrice', 0))
-        news_list.append("BTC 24小時變動 {:.1f}%，現價 ${:.0f}".format(pct, price))
-    except: pass
-    
-    # 來源2: CryptoPanic
-    try:
-        r = requests.get(
-            "https://cryptopanic.com/api/v1/posts/?auth_token={}&public=true&filter=hot".format(PANIC_API_KEY),
-            timeout=8)
-        d = r.json()
-        if d.get('results'):
-            for item in d['results'][:3]:
-                news_list.append(item['title'])
-    except: pass
-    
-    # 來源3: RSS 新聞（多個來源）
-    rss_urls = [
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    ]
-    import re as _re
-    for url in rss_urls:
-        try:
-            r = requests.get(url, timeout=8)
-            items = _re.findall(r'<item[^>]*>.*?</item>', r.text, _re.DOTALL)
-            for item in items[:2]:
-                t = _re.search(r'<title>(.*?)</title>', item, _re.DOTALL)
-                if t:
-                    raw = t.group(1).replace('<![CDATA[','').replace(']]>','').strip()
-                    if raw: news_list.append(raw)
-        except: pass
-    
-    return news_list[:8]  # 最多8條新聞
+    return bot_news_disabled.fetch_crypto_news()
 
 def analyze_news_with_ai(news_list):
-    """用 AI / 關鍵字分析新聞對加密市場的影響，回傳評分和摘要"""
-    if not news_list:
-        return 0, "無新聞", "無法獲取新聞"
-
-    news_text = "\n".join(["- " + n for n in news_list])
-    prompt = """你是加密貨幣市場分析師。以下是最新新聞：
-
-{}
-
-請分析這些新聞對加密貨幣市場（特別是BTC、ETH等主流幣）的影響。
-必須只回傳以下JSON格式，不要其他文字：
-{{"score": 數字, "sentiment": "情緒描述", "summary": "50字內的影響摘要"}}
-
-score 規則：
-+5 = 極度利多（川普支持比特幣、ETF獲批、Fed降息）
-+3 = 利多（機構買入、正面法規、市場上漲）
-0 = 中性
--3 = 利空（監管打壓、市場下跌）
--5 = 極度利空（全面禁令、重大崩盤、戰爭）""".format(news_text)
-
-    if ANTHROPIC_KEY:
-        try:
-            r = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                timeout=12,
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 200,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
-            )
-            result = r.json()
-            text_out = result['content'][0]['text'].strip()
-            import json as _json
-            data = _json.loads(text_out)
-            return data.get('score', 0), data.get('sentiment', '中性'), data.get('summary', '')
-        except Exception as e:
-            print("Anthropic 分析失敗: {}".format(e))
-
-    if OPENAI_API_KEY:
-        try:
-            r = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": "Bearer {}".format(OPENAI_API_KEY),
-                    "Content-Type": "application/json"
-                },
-                timeout=12,
-                json={
-                    "model": "gpt-4o-mini",
-                    "max_tokens": 200,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
-            )
-            result = r.json()
-            text_out = result['choices'][0]['message']['content'].strip()
-            import json as _json
-            data = _json.loads(text_out)
-            return data.get('score', 0), data.get('sentiment', '中性'), data.get('summary', '')
-        except Exception as e:
-            print("OpenAI 分析失敗: {}".format(e))
-
-    combined = " ".join(news_list).lower()
-    if any(w in combined for w in ["trump","bitcoin reserve","etf approved","fed cut","rate cut"]):
-        return 5, "極度看多 🚀", "重大利多消息"
-    elif any(w in combined for w in ["surge","rally","bullish","breakout","ath"]):
-        return 3, "看多 📈", "市場正面消息"
-    elif any(w in combined for w in ["crash","ban","bearish","collapse","dump","seized"]):
-        return -4, "看空 📉", "市場負面消息"
-    return 0, "中性 ➡️", "市場消息中性"
+    return bot_news_disabled.analyze_news_with_ai(news_list)
 
 def news_thread():
-    time.sleep(5)  # 等其他執行緒先啟動
-    while True:
-        try:
-            news_list = fetch_crypto_news()
-            if news_list:
-                score, sentiment, summary = analyze_news_with_ai(news_list)
-                score = max(min(int(score), 5), -5)  # 限制在 -5 到 +5
-                title = news_list[0] if news_list else "無新聞"
-                display = "[AI分析] {} | {}".format(sentiment, summary) if summary else title
-                set_cached_news(score, sentiment, summary, display)
-                update_state(
-                    news_score=score,
-                    news_sentiment=sentiment,
-                    latest_news_title=display
-                )
-                print("AI新聞分析完成: {} 分 | {} | {}".format(score, sentiment, summary[:40]))
-            else:
-                update_state(news_sentiment="新聞獲取失敗，使用中性")
-        except Exception as e:
-            print("新聞執行緒錯誤: {}".format(e))
-        time.sleep(300)  # 5分鐘更新一次（節省 AI API 費用）
+    bot_news_disabled.news_thread(update_state=update_state, set_cached_news=set_cached_news, sleep_sec=300)
 
 # =====================================================
 # 移動止盈追蹤系統
@@ -6630,8 +6418,9 @@ def _default_ai_db():
 
 def load_ai_db():
     try:
-        with open(AI_DB_PATH, 'r', encoding='utf-8') as f:
-            db = json.load(f)
+        db = atomic_json_load(AI_DB_PATH, None)
+        if db is None:
+            return _default_ai_db()
         base = _default_ai_db()
         for k, v in base.items():
             db.setdefault(k, v)
@@ -6641,9 +6430,7 @@ def load_ai_db():
 
 def save_ai_db(db):
     try:
-        os.makedirs(os.path.dirname(AI_DB_PATH), exist_ok=True)
-        with open(AI_DB_PATH, 'w', encoding='utf-8') as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
+        atomic_json_save(AI_DB_PATH, db, ensure_ascii=False, indent=2)
     except Exception as e:
         print('AI DB 儲存失敗:', e)
 
@@ -7468,10 +7255,11 @@ def auto_backtest_thread():
 def memory_guard_thread():
     while True:
         try:
-            for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS, PROTECTION_STATE]:
-                if len(cache) > 500:
-                    for k in list(cache.keys())[:200]:
-                        cache.pop(k, None)
+            with CACHE_LOCK:
+                for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS]:
+                    prune_mapping(cache, max_size=500, prune_count=200)
+            with PROTECTION_LOCK:
+                prune_mapping(PROTECTION_STATE, max_size=500, prune_count=200)
             with AI_LOCK:
                 AI_PANEL['memory'] = {'score_cache': len(SCORE_CACHE),'signal_meta_cache': len(SIGNAL_META_CACHE),'entry_locks': len(ENTRY_LOCKS),'protection_state': len(PROTECTION_STATE),'fvg_orders': len(FVG_ORDERS)}
             gc.collect()
@@ -7684,18 +7472,43 @@ def api_state():
     except Exception:
         return resp
 
+def reconcile_exchange_state():
+    """啟動時同步交易所真實倉位與本地保護狀態，降低本地/交易所不同步風險。"""
+    try:
+        positions = exchange.fetch_positions()
+    except Exception as e:
+        print('啟動同步倉位失敗: {}'.format(e))
+        return
+    live = []
+    with PROTECTION_LOCK:
+        for p in positions or []:
+            contracts = float((p or {}).get('contracts', 0) or 0)
+            if abs(contracts) <= 0:
+                continue
+            sym = p.get('symbol')
+            live.append(sym)
+            PROTECTION_STATE.setdefault(sym, {})
+            PROTECTION_STATE[sym]['has_position'] = True
+            PROTECTION_STATE[sym]['updated_at'] = tw_now_str()
+        for sym in list(PROTECTION_STATE.keys()):
+            if sym not in live:
+                PROTECTION_STATE[sym]['has_position'] = False
+                PROTECTION_STATE[sym]['updated_at'] = tw_now_str()
+    update_state(protection_state=snapshot_mapping(PROTECTION_STATE))
+
 def start_all_threads():
     load_full_state()
     load_risk_state()
+    reconcile_exchange_state()
     _refresh_ai_panel_market_meta()
     sync_ai_state_to_dashboard(force_regime=True)
-    threads = [(news_thread,'news'),(position_thread,'position'),(enhanced_position_thread,'enhanced_position'),(scan_thread,'scan'),(trailing_stop_thread,'trailing'),(session_monitor_thread,'session'),(market_analysis_thread,'market'),(fvg_order_monitor_thread,'fvg_monitor'),(auto_backtest_thread,'auto_backtest'),(memory_guard_thread,'memory_guard')]
+    threads = [(position_thread,'position'),(enhanced_position_thread,'enhanced_position'),(scan_thread,'scan'),(trailing_stop_thread,'trailing'),(session_monitor_thread,'session'),(market_analysis_thread,'market'),(fvg_order_monitor_thread,'fvg_monitor'),(auto_backtest_thread,'auto_backtest'),(memory_guard_thread,'memory_guard')]
     for fn, name in threads:
         t = threading.Thread(target=watchdog, args=(fn, name), daemon=True, name=name)
         t.start()
     app.view_functions['api_state'] = api_state_enhanced
-    update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE))
-    print('=== V11 AI / UI 修正版執行緒已啟動 ===')
+    update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE), news_score=0, news_sentiment='已停用', latest_news_title='新聞系統已停用')
+    print('=== V11 AI / UI 修正版執行緒已啟動（新聞系統已停用） ===')
 
 if __name__=='__main__':
     app.view_functions['api_state'] = api_state_enhanced
