@@ -7466,6 +7466,113 @@ def api_ai_db_stats():
         'mode': phase,
     })
 
+
+@app.route('/api/ai_learning_recent')
+def api_ai_learning_recent():
+    """回傳最近學習到的實單資料（從 SQLite learning_trades 讀取）"""
+    limit_arg = request.args.get('limit', '20')
+    try:
+        limit = max(1, min(int(limit_arg), 200))
+    except Exception:
+        limit = 20
+
+    rows = []
+    error = None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT trade_id, symbol, result, source, entry_time, exit_time, created_at, updated_at, data_json
+            FROM learning_trades
+            ORDER BY COALESCE(updated_at, created_at, exit_time, entry_time) DESC
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        fetched = cur.fetchall()
+        conn.close()
+        for r in fetched:
+            payload = {}
+            try:
+                payload = json.loads(r[8]) if r[8] else {}
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            rows.append({
+                'trade_id': r[0],
+                'symbol': r[1],
+                'result': r[2],
+                'source': r[3],
+                'entry_time': r[4],
+                'exit_time': r[5],
+                'created_at': r[6],
+                'updated_at': r[7],
+                'pnl_pct': payload.get('pnl_pct'),
+                'learn_pnl_pct': payload.get('learn_pnl_pct'),
+                'edge_pct': payload.get('edge_pct'),
+                'side': payload.get('side'),
+                'setup_label': payload.get('setup_label'),
+                'regime': (payload.get('breakdown') or {}).get('Regime') if isinstance(payload.get('breakdown'), dict) else None,
+            })
+    except Exception as e:
+        error = str(e)
+
+    return jsonify({
+        'ok': error is None,
+        'limit': limit,
+        'count': len(rows),
+        'data': rows,
+        'error': error,
+    })
+
+
+@app.route('/api/ai_symbol_stats')
+def api_ai_symbol_stats():
+    """回傳各幣學習筆數與勝率，方便快速檢查 AI 學習結果。"""
+    rows = []
+    error = None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                symbol,
+                COUNT(*) AS total,
+                SUM(CASE WHEN LOWER(COALESCE(result, '')) = 'win' THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN LOWER(COALESCE(result, '')) = 'loss' THEN 1 ELSE 0 END) AS loss_count,
+                ROUND(100.0 * SUM(CASE WHEN LOWER(COALESCE(result, '')) = 'win' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) AS win_rate
+            FROM learning_trades
+            GROUP BY symbol
+            ORDER BY total DESC, symbol ASC
+            """
+        )
+        fetched = cur.fetchall()
+        conn.close()
+        rows = [
+            {
+                'symbol': r[0],
+                'total': int(r[1] or 0),
+                'win_count': int(r[2] or 0),
+                'loss_count': int(r[3] or 0),
+                'win_rate': float(r[4] or 0),
+            }
+            for r in fetched
+        ]
+    except Exception as e:
+        error = str(e)
+
+    return jsonify({
+        'ok': error is None,
+        'count': len(rows),
+        'data': rows,
+        'error': error,
+    })
+
 def api_state_enhanced():
     resp = _BASE_API_STATE()
     try:
