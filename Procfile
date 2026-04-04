@@ -1,0 +1,1 @@
+web: PYTHONUNBUFFERED=1 gunicorn -c gunicorn.conf.py app:app --workers 1 --threads 8 --timeout 300 --bind 0.0.0.0:$PORT
