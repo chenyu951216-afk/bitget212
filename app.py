@@ -24,11 +24,11 @@ exchange.enableRateLimit = True
 PANIC_API_KEY   = os.getenv('PANIC_API_KEY', 'cde101d65a00a418e451ae0118ed0835275781e1')
 OPENAI_API_KEY  = os.getenv('OPENAI_API_KEY', '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')
 ANTHROPIC_KEY   = os.getenv('ANTHROPIC_API_KEY', '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')
-ORDER_THRESHOLD         = 55   # 預設門檻 55
-ORDER_THRESHOLD_DEFAULT = 55   # 預設值
-ORDER_THRESHOLD_HIGH    = 70   # 持續滿倉後提高到 70
-ORDER_THRESHOLD_DROP    = 2    # 每 3 輪無新單下降 2 分
-ORDER_THRESHOLD_FLOOR   = 52   # 最低只降到 52
+ORDER_THRESHOLD         = 60   # 預設門檻 60
+ORDER_THRESHOLD_DEFAULT = 60   # 預設值
+ORDER_THRESHOLD_HIGH    = 80   # 持續滿倉後提高到 80
+ORDER_THRESHOLD_DROP    = 2    # 每空一輪下降 2 分
+ORDER_THRESHOLD_FLOOR   = 55   # 最低只降到 55
 
 # =====================================================
 # 核心交易參數
@@ -57,6 +57,10 @@ ENTRY_LOCK_SEC      = 300       # 同一幣種 5 分鐘內不重複開新單
 MIN_RR_HARD_FLOOR   = 1.20      # 自動下單最低 RR
 TREND_AI_SEMI_TRADES = 30       # 趨勢學習 30 筆後半介入
 TREND_AI_FULL_TRADES = 50       # 趨勢學習 50 筆後全介入
+AI_MIN_SAMPLE_EFFECT = 5        # AI/參數學習至少 5 筆才開始影響決策
+SYMBOL_BLOCK_MIN_TRADES = 11    # 同幣實單超過 10 筆才啟用封鎖
+SYMBOL_BLOCK_MIN_WINRATE = 40.0 # 同幣勝率低於 40% 停止再下
+TREND_LEARNING_RESET_FROM = "2026-04-04 00:00:00"  # 趨勢學習從這之後的實單重新開始
 TREND_EARLY_EXIT_MIN_RUN = 1.20 # 平倉後若後續延續超過此幅度，視為可能太早出場
 TREND_EARLY_EXIT_MIN_EDGE = 0.35# 平倉後先回踩不超過這個比例，才算健康回踩後延續
 SIGNAL_META_CACHE   = {}        # 最近一次分析快取（給追蹤/驗證用）
@@ -85,7 +89,7 @@ RISK_LOCK = threading.Lock()
 
 # ── 動態門檻狀態 ──
 _DT = {
-    "current":          50,   # 當前門檻（最低只降到48）
+    "current":          60,   # 當前門檻（最低只降到55）
     "last_order_time":  None, # 最近下單時間
     "full_rounds":      0,    # 連續滿倉輪數
     "empty_rounds":     0,    # 門檻55時連續空倉輪數
@@ -172,17 +176,17 @@ def update_dynamic_threshold(top_sigs=None):
             dt["no_order_rounds"] = 0  # 已在最低48，重置
 
 def record_order_placed():
-    """下單後呼叫，重置計時並回到預設50"""
+    """下單後呼叫，重置計時並回到預設60"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
         _DT["last_order_time"] = datetime.now()
         _DT["no_order_rounds"] = 0  # 重置輪數計數
         _DT["empty_rounds"]    = 0
-        # 下單後若門檻曾降低（<40），回到50
+        # 下單後若門檻曾降低，回到預設值
         if _DT["current"] < ORDER_THRESHOLD_DEFAULT:
             _DT["current"] = ORDER_THRESHOLD_DEFAULT
             ORDER_THRESHOLD = ORDER_THRESHOLD_DEFAULT
-            print("↩️ 門檻回到50（有新下單）")
+            print("↩️ 門檻回到{}（有新下單）".format(ORDER_THRESHOLD_DEFAULT))
             update_state(threshold_info={"current": ORDER_THRESHOLD_DEFAULT, "phase": "預設"})
 
 # =====================================================
@@ -1243,6 +1247,31 @@ def get_live_trades(closed_only=False):
         rows = [t for t in rows if t.get("result") in ("win", "loss")]
     return rows
 
+def _parse_trade_time(trade):
+    for key in ("exit_time", "entry_time"):
+        raw = str((trade or {}).get(key) or "").strip()
+        if not raw:
+            continue
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except Exception:
+                pass
+    return None
+
+def get_trend_live_trades(closed_only=False):
+    rows = get_live_trades(closed_only=closed_only)
+    try:
+        reset_dt = datetime.strptime(TREND_LEARNING_RESET_FROM, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return rows
+    filtered = []
+    for t in rows:
+        trade_dt = _parse_trade_time(t)
+        if trade_dt and trade_dt >= reset_dt:
+            filtered.append(t)
+    return filtered
+
 def _trade_learn_metric(trade):
     """AI learning metric: use account impact when available, otherwise fallback safely.
     - learn_pnl_pct: preferred persistent field
@@ -1274,7 +1303,7 @@ def _trade_edge_pct(trade):
     return 0.0
 
 def _trend_learning_stage(closed_count=None):
-    cnt = len(get_live_trades(closed_only=True)) if closed_count is None else int(closed_count or 0)
+    cnt = len(get_trend_live_trades(closed_only=True)) if closed_count is None else int(closed_count or 0)
     if cnt < TREND_AI_SEMI_TRADES:
         return 'learning', 0.0
     if cnt < TREND_AI_FULL_TRADES:
@@ -1309,7 +1338,7 @@ def _trade_post_move_profile(trade):
     }
 
 def _trend_learning_profile(symbol='', regime='neutral', setup=''):
-    rows = get_live_trades(closed_only=True)
+    rows = get_trend_live_trades(closed_only=True)
     stage, intervene_ratio = _trend_learning_stage(len(rows))
     regime = str(regime or 'neutral')
     setup_mode = _normalize_setup_mode(setup)
@@ -1348,7 +1377,7 @@ def _trend_learning_profile(symbol='', regime='neutral', setup=''):
     if not picked:
         return {
             'stage': stage, 'intervene_ratio': intervene_ratio, 'count': 0, 'continuation_rate': 0.0,
-            'avg_run_pct': 0.0, 'avg_pullback_pct': 0.0, 'hold_bias': 0.0, 'source': 'none', 'note': '趨勢樣本不足'
+            'avg_run_pct': 0.0, 'avg_pullback_pct': 0.0, 'hold_bias': 0.0, 'source': 'none', 'note': '趨勢樣本不足（重置後重新累積）'
         }
 
     profs = [_trade_post_move_profile(t) for t in picked]
@@ -1510,13 +1539,12 @@ def _regime_setup_fit(regime='neutral', setup=''):
 def _symbol_hard_block(symbol=''):
     rows = [t for t in get_live_trades(closed_only=True) if str(t.get('symbol')) == str(symbol)]
     cnt = len(rows)
-    if cnt < 12:
+    if cnt < SYMBOL_BLOCK_MIN_TRADES:
         return False, ''
     wins = sum(1 for t in rows if t.get('result') == 'win')
-    wr = wins / max(cnt, 1)
-    avg = sum(_trade_learn_metric(t) for t in rows) / max(cnt, 1)
-    if wr < 0.35 and avg < 0:
-        return True, '實單長期虧損，封鎖幣種'
+    wr = wins / max(cnt, 1) * 100.0
+    if wr < SYMBOL_BLOCK_MIN_WINRATE:
+        return True, '該幣實單超過10筆且勝率低於40%，封鎖幣種'
     return False, ''
 
 def _ai_warmup_mode():
@@ -1539,7 +1567,7 @@ def save_full_state():
             } for k, v in TRAILING_STATE.items()}
         backup = {
             "trailing_state": trail_copy,
-            "threshold": {"current": _DT.get("current", 40)},
+            "threshold": {"current": _DT.get("current", ORDER_THRESHOLD_DEFAULT)},
             "timestamp": datetime.now().isoformat()
         }
         with open(STATE_BACKUP_PATH, 'w', encoding='utf-8') as f:
@@ -1559,8 +1587,8 @@ def load_full_state():
         with TRAILING_LOCK:
             for sym, ts in backup.get("trailing_state", {}).items():
                 TRAILING_STATE[sym] = ts
-        thresh = backup.get("threshold", {}).get("current", 38)
-        # 重新部署後門檻重置為預設38，不沿用上次的高門檻
+        thresh = backup.get("threshold", {}).get("current", ORDER_THRESHOLD_DEFAULT)
+        # 重新部署後門檻不高於預設值
         thresh = min(thresh, ORDER_THRESHOLD_DEFAULT)
         with _DT_LOCK:
             _DT["current"] = thresh
@@ -1617,6 +1645,81 @@ def load_risk_state():
 LEARN_DB   = load_learn_db()
 BACKTEST_DB = load_backtest_db()
 LEARN_LOCK = threading.Lock()
+
+def _rebuild_live_learning_db(db):
+    db = dict(db or {})
+    live_trades = [dict(t) for t in (db.get("trades", []) or []) if _is_live_source((t or {}).get("source"))]
+    live_closed = [t for t in live_trades if t.get("result") in ("win", "loss")]
+
+    rebuilt = {
+        "trades": live_trades,
+        "pattern_stats": {},
+        "symbol_stats": {},
+        "atr_params": dict((db.get("atr_params") or {"default_sl": 2.0, "default_tp": 3.5})),
+        "total_trades": 0,
+        "win_rate": 0.0,
+        "avg_pnl": 0.0,
+        "trend_learning_reset_from": TREND_LEARNING_RESET_FROM,
+        "live_only_mode": True,
+    }
+    rebuilt["atr_params"]["default_sl"] = float(rebuilt["atr_params"].get("default_sl", 2.0) or 2.0)
+    rebuilt["atr_params"]["default_tp"] = float(rebuilt["atr_params"].get("default_tp", 3.5) or 3.5)
+
+    for trade in live_closed:
+        bd = dict(trade.get("breakdown") or {})
+        active_keys = [k for k, v in bd.items() if v != 0]
+        pkey = "|".join(sorted(active_keys))
+        metric = float(_trade_learn_metric(trade))
+        atr_sl = float(trade.get("atr_mult_sl", 2.0) or 2.0)
+        atr_tp = float(trade.get("atr_mult_tp", 3.0) or 3.0)
+
+        if pkey not in rebuilt["pattern_stats"]:
+            rebuilt["pattern_stats"][pkey] = {
+                "win": 0, "loss": 0, "sample_count": 0, "total_pnl": 0.0,
+                "avg_pnl": 0.0, "best_sl": atr_sl, "best_tp": atr_tp,
+                "tp_candidates": [], "sl_candidates": []
+            }
+        ps = rebuilt["pattern_stats"][pkey]
+        ps["sample_count"] += 1
+        ps["total_pnl"] += metric
+        ps["avg_pnl"] = round(ps["total_pnl"] / max(ps["sample_count"], 1), 4)
+        if trade.get("result") == "win":
+            ps["win"] += 1
+            ps["tp_candidates"].append(atr_tp)
+        else:
+            ps["loss"] += 1
+            ps["sl_candidates"].append(atr_sl)
+        if ps["sample_count"] >= AI_MIN_SAMPLE_EFFECT:
+            wr = ps["win"] / max(ps["sample_count"], 1)
+            if wr >= 0.6 and ps["tp_candidates"]:
+                ps["best_tp"] = round(min(max(ps["tp_candidates"]) * 1.1, 5.0), 2)
+                ps["best_sl"] = round(max(ps.get("best_sl", 2.0) * 0.95, 1.8), 2)
+            elif wr < 0.4:
+                ps["best_sl"] = round(min(ps.get("best_sl", 2.0) * 0.85, 1.8), 2)
+                ps["best_tp"] = round(max(ps.get("best_tp", 3.5) * 0.9, 2.8), 2)
+
+        sym = str(trade.get("symbol") or "")
+        if sym:
+            ss = rebuilt["symbol_stats"].setdefault(sym, {"win": 0, "loss": 0, "count": 0, "total_pnl": 0.0, "total_margin_pct": 0.0})
+            ss["count"] += 1
+            ss["total_pnl"] += metric
+            ss["total_margin_pct"] += float(trade.get("margin_pct", 0) or 0)
+            if trade.get("result") == "win":
+                ss["win"] += 1
+            else:
+                ss["loss"] += 1
+
+    if live_closed:
+        rebuilt["total_trades"] = len(live_closed)
+        wins = sum(1 for t in live_closed if t.get("result") == "win")
+        rebuilt["win_rate"] = round(wins / len(live_closed) * 100, 1)
+        rebuilt["avg_pnl"] = round(sum(_trade_learn_metric(t) for t in live_closed) / len(live_closed), 4)
+
+    return rebuilt
+
+LEARN_DB = _rebuild_live_learning_db(LEARN_DB)
+save_learn_db(LEARN_DB)
+
 
 # =====================================================
 # 全域狀態
@@ -2007,7 +2110,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
         'hard_block': False,
         'strategy': strategy_key,
         'strategy_mode': setup_mode,
-        'note': 'AI樣本不足，沿用主策略（回測僅供候選）',
+        'note': 'AI樣本不足，沿用主策略（僅吃實單，回測只供候選）',
         'confidence': 0.0,
         'status': 'warmup',
         'symbol_blocked': False,
@@ -2219,7 +2322,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
                 notes.append('趨勢主策略')
             scnt = int(symbol_stats.get('count', 0) or 0)
             swr = float(symbol_stats.get('win_rate', 0) or 0)
-            if scnt >= 8 and swr < 45:
+            if scnt >= SYMBOL_BLOCK_MIN_TRADES and swr < SYMBOL_BLOCK_MIN_WINRATE:
                 th_adj += 1.5
                 notes.append('幣種實單偏弱')
             profile['threshold_adjust'] = round(th_adj, 2)
@@ -2342,7 +2445,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         if not fit_ok:
             hard_block = True
             reasons.append(fit_note)
-        if int(profile.get('sample_count', 0) or 0) < TREND_AI_SEMI_TRADES and score < max(ai_threshold + 5.0, 58.0):
+        if int(profile.get('sample_count', 0) or 0) < AI_MIN_SAMPLE_EFFECT and score < max(ai_threshold + 5.0, 58.0):
             hard_block = True
             reasons.append('局部樣本不足')
         ai_ok = not hard_block
@@ -2583,14 +2686,14 @@ def get_breakout_pullback_entry(symbol, side, current_price, atr):
 # 統計濾網：該幣勝率是否達標
 # =====================================================
 def is_symbol_allowed(symbol):
-    """若該幣有 >=7 筆紀錄且勝率 <40%，封鎖下單，改為觀察"""
+    """若該幣實單已超過10筆且勝率 <40%，封鎖下單，改為觀察"""
     with LEARN_LOCK:
         st = LEARN_DB.get("symbol_stats", {}).get(symbol, {})
-    n = st.get("count", 0)
-    if n < 7:
+    n = int(st.get("count", 0) or 0)
+    if n < SYMBOL_BLOCK_MIN_TRADES:
         return True, n, 0.0   # 樣本不足，允許
-    wr = st.get("win", 0) / n * 100
-    return wr >= 40, n, round(wr, 1)
+    wr = float(st.get("win", 0) or 0) / max(n, 1) * 100.0
+    return wr >= SYMBOL_BLOCK_MIN_WINRATE, n, round(wr, 1)
 
 # =====================================================
 # ADX：趨勢強度
@@ -3260,12 +3363,12 @@ def get_best_atr_params(breakdown_keys):
         pkey = "|".join(sorted(breakdown_keys))
         if pkey in db["pattern_stats"]:
             st = db["pattern_stats"][pkey]
-            if st.get("sample_count", 0) >= 3:
+            if st.get("sample_count", 0) >= AI_MIN_SAMPLE_EFFECT:
                 return st.get("best_sl", db["atr_params"]["default_sl"]),                        st.get("best_tp", db["atr_params"]["default_tp"])
         best_match=None; best_overlap=0; ks=set(breakdown_keys)
         for k,st in db["pattern_stats"].items():
             ov=len(ks & set(k.split("|")))
-            if ov>best_overlap and st.get("sample_count",0)>=3:
+            if ov>best_overlap and st.get("sample_count",0)>=AI_MIN_SAMPLE_EFFECT:
                 best_overlap=ov; best_match=st
         if best_match and best_overlap>=2:
             return best_match.get("best_sl",db["atr_params"]["default_sl"]),                    best_match.get("best_tp",db["atr_params"]["default_tp"])
@@ -3290,7 +3393,7 @@ def get_learned_rr_target(symbol, regime, setup, breakdown_keys, sl_mult, tp_mul
         db = LEARN_DB
         pkey = "|".join(sorted(breakdown_keys))
         pst = dict((db.get("pattern_stats", {}) or {}).get(pkey, {}) or {})
-        if int(pst.get("sample_count", 0) or 0) >= 3:
+        if int(pst.get("sample_count", 0) or 0) >= AI_MIN_SAMPLE_EFFECT:
             _push(float(pst.get("best_tp", tp_mult) or tp_mult) / max(float(pst.get("best_sl", sl_mult) or sl_mult), 1e-9), 3.0)
 
         ks = set(breakdown_keys or [])
@@ -3298,7 +3401,7 @@ def get_learned_rr_target(symbol, regime, setup, breakdown_keys, sl_mult, tp_mul
         best_overlap = 0
         for k, st in (db.get("pattern_stats", {}) or {}).items():
             cnt = int(st.get("sample_count", 0) or 0)
-            if cnt < 3:
+            if cnt < AI_MIN_SAMPLE_EFFECT:
                 continue
             ov = len(ks & set(str(k).split("|")))
             if ov > best_overlap:
@@ -4583,7 +4686,7 @@ def learn_from_closed_trade(trade_id):
                 ps["win"] += 1; ps["tp_candidates"].append(trade.get("atr_mult_tp", 3.0))
             else:
                 ps["loss"] += 1; ps["sl_candidates"].append(trade.get("atr_mult_sl", 2.0))
-            if ps["sample_count"] >= 5:
+            if ps["sample_count"] >= AI_MIN_SAMPLE_EFFECT:
                 wr = ps["win"] / max(ps["sample_count"], 1)
                 if wr >= 0.6 and ps["tp_candidates"]:
                     ps["best_tp"] = round(min(max(ps["tp_candidates"]) * 1.1, 5.0), 2)
