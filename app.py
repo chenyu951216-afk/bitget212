@@ -238,71 +238,159 @@ _DT = {
 }
 _DT_LOCK = threading.Lock()
 
+def _estimate_ai_threshold_target(top_sigs=None):
+    """由當前候選訊號品質自動估計門檻，不再依賴固定最高/最低設定。"""
+    sigs = list(top_sigs or [])[:8]
+    if not sigs:
+        return 58.0, '無強訊號，維持保守'
+
+    scored = []
+    for sig in sigs:
+        try:
+            score = abs(float(sig.get('score', 0) or 0))
+            rr = float(sig.get('rr_ratio', 0) or 0)
+            eq = float(sig.get('entry_quality', 0) or 0)
+            regime_conf = float(sig.get('regime_confidence', 0) or 0)
+            anti_chase_ok = bool(sig.get('anti_chase_ok', True))
+            breakdown = dict(sig.get('breakdown') or {})
+            profile = _ai_strategy_profile(
+                str(sig.get('symbol') or ''),
+                regime=str(sig.get('regime') or breakdown.get('Regime') or 'neutral'),
+                setup=str(sig.get('setup_label') or breakdown.get('Setup') or ''),
+            )
+            sample_cnt = float(profile.get('sample_count', 0) or 0)
+            phase = str(profile.get('phase') or 'learning')
+            quality = 0.0
+            quality += max(min((score - 50.0) * 0.20, 5.0), -3.5)
+            quality += max(min((rr - 1.20) * 5.5, 4.2), -4.0)
+            quality += max(min((eq - 2.10) * 3.2, 3.2), -3.0)
+            quality += max(min(regime_conf * 5.0, 2.2), -1.0)
+            quality += min(sample_cnt / 18.0, 2.4)
+            if phase == 'full':
+                quality += 1.25
+            elif phase == 'semi':
+                quality += 0.55
+            if bool(profile.get('ready')):
+                quality += 0.9
+            if str(profile.get('status') or '') == 'reject':
+                quality -= 1.4
+            if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
+                quality -= 3.5
+            if not anti_chase_ok:
+                quality -= 1.8
+            if bool(sig.get('fvg_valid')):
+                quality += 0.7
+            scored.append((quality, sig, profile))
+        except Exception:
+            continue
+
+    if not scored:
+        return 58.0, '訊號解析不足，維持保守'
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_q = float(scored[0][0])
+    avg_q = sum(float(x[0]) for x in scored[:3]) / max(min(3, len(scored)), 1)
+    best_sig = scored[0][1]
+    best_profile = scored[0][2]
+    top_score = abs(float(best_sig.get('score', 0) or 0))
+    top_rr = float(best_sig.get('rr_ratio', 0) or 0)
+    top_eq = float(best_sig.get('entry_quality', 0) or 0)
+
+    target = 57.5
+    target -= max(min((avg_q - 1.2) * 1.55, 6.2), -4.5)
+    target -= max(min((top_score - 58.0) * 0.08, 2.4), -1.8)
+    target -= max(min((top_rr - 1.35) * 1.8, 1.8), -1.4)
+    target -= max(min((top_eq - 2.30) * 0.95, 1.2), -1.0)
+
+    if bool(best_profile.get('ready')):
+        target -= 1.0
+    if str(best_profile.get('phase') or '') == 'learning' and float(best_profile.get('sample_count', 0) or 0) < 5:
+        target += 0.8
+    if bool(best_profile.get('symbol_blocked')) or bool(best_profile.get('strategy_blocked')):
+        target += 2.5
+
+    # 真正的 AI 自適應範圍：保留安全欄杆，但不再受舊高低門檻規則控制
+    target = max(46.0, min(72.0, target))
+    note = 'AI動態:{} | top {:.1f} | RR {:.2f} | EQ {:.2f} | 樣本 {}'.format(
+        str(best_profile.get('phase') or 'learning'), top_score, top_rr, top_eq, int(best_profile.get('sample_count', 0) or 0)
+    )
+    return round(target, 2), note
+
+
 def update_dynamic_threshold(top_sigs=None):
-    """
-    動態門檻循環（每輪掃描結束呼叫）：
-    預設 60
-    → 連續滿倉 5 輪 → 升到 80
-    → 在 80 門檻下連續 5 輪有空位 → 回到 60
-    → 有空位且連續 3 輪無新單 → 每輪降 2，最低 55
-    → 新下單後回到 60
-    """
+    """AI 自主門檻：依候選訊號/學習狀態動態調整，不再套用舊版固定高低門檻。"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
         dt = _DT
         with STATE_LOCK:
-            pos_count = len(STATE.get("active_positions", []))
-        is_full = pos_count >= MAX_OPEN_POSITIONS
-        if is_full:
-            dt["full_rounds"] += 1
-            dt["empty_rounds"] = 0
-            dt["no_order_rounds"] = 0
-            if dt["full_rounds"] >= 5 and dt["current"] < ORDER_THRESHOLD_HIGH:
-                dt["current"] = ORDER_THRESHOLD_HIGH
-                ORDER_THRESHOLD = ORDER_THRESHOLD_HIGH
-                print("📈 門檻升至{}（連續滿倉{}輪）".format(ORDER_THRESHOLD_HIGH, dt["full_rounds"]))
-                update_state(threshold_info={"current": ORDER_THRESHOLD_HIGH, "phase": "嚴格（持續滿倉）", "full_rounds": dt["full_rounds"]})
-            return
-        dt["full_rounds"] = 0
-        if dt["current"] >= ORDER_THRESHOLD_HIGH:
-            dt["empty_rounds"] += 1
-            if dt["empty_rounds"] >= 5:
-                rolled = dt["empty_rounds"]
-                dt["current"] = ORDER_THRESHOLD_DEFAULT
-                ORDER_THRESHOLD = ORDER_THRESHOLD_DEFAULT
-                dt["empty_rounds"] = 0
-                print("📉 門檻回到{}（高門檻下有空位{}輪）".format(ORDER_THRESHOLD_DEFAULT, rolled))
-                update_state(threshold_info={"current": ORDER_THRESHOLD_DEFAULT, "phase": "預設", "empty_rounds": rolled})
-            else:
-                print("⏱ 門檻{}有空位中 {}/5 輪".format(ORDER_THRESHOLD_HIGH, dt["empty_rounds"]))
-            return
-        dt["empty_rounds"] = 0
-        if dt["current"] > ORDER_THRESHOLD_FLOOR:
-            dt["no_order_rounds"] = dt.get("no_order_rounds", 0) + 1
-            print("⏱ 門檻{}空倉計數: {}/3 輪".format(dt["current"], dt["no_order_rounds"]))
-            if dt["no_order_rounds"] >= 3:
-                new_val = max(dt["current"] - ORDER_THRESHOLD_DROP, ORDER_THRESHOLD_FLOOR)
-                dt["current"] = new_val
-                ORDER_THRESHOLD = new_val
-                dt["no_order_rounds"] = 0
-                print("⬇️ 門檻降至{}（空倉持續3輪）".format(new_val))
-                update_state(threshold_info={"current": new_val, "phase": "預設" if new_val <= ORDER_THRESHOLD_FLOOR else "降溫中"})
+            pos_count = len(STATE.get('active_positions', []))
+
+        target, note = _estimate_ai_threshold_target(top_sigs)
+        if pos_count >= MAX_OPEN_POSITIONS:
+            dt['full_rounds'] = dt.get('full_rounds', 0) + 1
+            target = min(72.0, target + min(4.0, dt['full_rounds'] * 0.45))
         else:
-            dt["no_order_rounds"] = 0
+            dt['full_rounds'] = 0
+
+        if top_sigs:
+            strong_count = 0
+            for sig in list(top_sigs)[:5]:
+                try:
+                    sig_score = abs(float(sig.get('score', 0) or 0))
+                    sig_rr = float(sig.get('rr_ratio', 0) or 0)
+                    sig_eq = float(sig.get('entry_quality', 0) or 0)
+                    if sig_score >= max(target - 1.5, 50.0) and sig_rr >= 1.20 and sig_eq >= 1.90:
+                        strong_count += 1
+                except Exception:
+                    pass
+            if strong_count == 0:
+                dt['no_order_rounds'] = dt.get('no_order_rounds', 0) + 1
+                target = min(70.0, target + min(2.2, dt['no_order_rounds'] * 0.55))
+            else:
+                dt['no_order_rounds'] = 0
+                if strong_count >= 2:
+                    target = max(46.0, target - min(1.8, strong_count * 0.45))
+        else:
+            dt['no_order_rounds'] = dt.get('no_order_rounds', 0) + 1
+
+        prev = float(dt.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
+        new_val = round(prev * 0.62 + float(target) * 0.38, 2)
+        new_val = max(46.0, min(72.0, new_val))
+        dt['current'] = new_val
+        ORDER_THRESHOLD = new_val
+        dt['last_ai_note'] = note
+        phase = 'AI積極' if new_val <= 51 else 'AI均衡' if new_val <= 60 else 'AI保守'
+        print('🧠 AI門檻更新 {:.1f} → {:.1f} | {}'.format(prev, new_val, note))
+        update_state(threshold_info={
+            'current': new_val,
+            'phase': phase,
+            'full_rounds': dt.get('full_rounds', 0),
+            'empty_rounds': dt.get('empty_rounds', 0),
+            'no_order_rounds': dt.get('no_order_rounds', 0),
+            'ai_note': note,
+            'target': round(float(target), 2),
+        })
 
 def record_order_placed():
-    """下單後呼叫，重置計時並回到預設60"""
+    """下單後呼叫：只做溫和回拉，避免把 AI 動態門檻重設成固定值。"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
-        _DT["last_order_time"] = datetime.now()
-        _DT["no_order_rounds"] = 0  # 重置輪數計數
-        _DT["empty_rounds"]    = 0
-        # 下單後若門檻曾降低，回到預設值
-        if _DT["current"] < ORDER_THRESHOLD_DEFAULT:
-            _DT["current"] = ORDER_THRESHOLD_DEFAULT
-            ORDER_THRESHOLD = ORDER_THRESHOLD_DEFAULT
-            print("↩️ 門檻回到{}（有新下單）".format(ORDER_THRESHOLD_DEFAULT))
-            update_state(threshold_info={"current": ORDER_THRESHOLD_DEFAULT, "phase": "預設"})
+        _DT['last_order_time'] = datetime.now()
+        _DT['no_order_rounds'] = 0
+        _DT['empty_rounds'] = 0
+        prev = float(_DT.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
+        nudged = round(prev + min(1.6, max(0.6, (58.0 - prev) * 0.25)), 2) if prev < 58.0 else round(min(prev + 0.4, 66.0), 2)
+        _DT['current'] = max(46.0, min(72.0, nudged))
+        ORDER_THRESHOLD = _DT['current']
+        print('↩️ AI門檻微調至{}（新下單後抑制過度連開）'.format(_DT['current']))
+        update_state(threshold_info={
+            'current': _DT['current'],
+            'phase': 'AI均衡' if _DT['current'] <= 60 else 'AI保守',
+            'full_rounds': _DT.get('full_rounds', 0),
+            'empty_rounds': _DT.get('empty_rounds', 0),
+            'no_order_rounds': _DT.get('no_order_rounds', 0),
+            'ai_note': _DT.get('last_ai_note', ''),
+        })
 
 # =====================================================
 # 開盤時段保護系統（台灣時間 UTC+8）
@@ -1842,13 +1930,12 @@ def load_full_state():
         with TRAILING_LOCK:
             for sym, ts in backup.get("trailing_state", {}).items():
                 TRAILING_STATE[sym] = ts
-        thresh = backup.get("threshold", {}).get("current", ORDER_THRESHOLD_DEFAULT)
-        # 重新部署後門檻不高於預設值
-        thresh = min(thresh, ORDER_THRESHOLD_DEFAULT)
+        thresh = float(backup.get('threshold', {}).get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
+        thresh = max(46.0, min(72.0, thresh))
         with _DT_LOCK:
-            _DT["current"] = thresh
+            _DT['current'] = thresh
         ORDER_THRESHOLD = thresh
-        print("✅ 狀態已從備份恢復，門檻:{}".format(thresh))
+        print('✅ 狀態已從備份恢復，AI門檻:{}' .format(thresh))
     except FileNotFoundError:
         print("⚠️ 無狀態備份，從頭開始")
     except Exception as e:
@@ -2520,6 +2607,13 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'loss_streak': loss_streak,
             'phase': phase,
             'trusted_local_count': trusted_local_cnt,
+            'local_count': local_cnt,
+            'mid_count': mid_cnt,
+            'global_count': global_cnt,
+            'soft_live_count': len(soft_rows),
+            'trusted_live_count': len(trusted_rows),
+            'strongest_local_count': max(local_cnt, trusted_local_cnt),
+            'fallback_level': fallback_level,
             'quarantine_count': len(quarantine_rows),
             'ready': (
                 not sym_block and phase == 'full' and status in ('valid', 'observe') and conf >= 0.22
@@ -2642,7 +2736,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     setup = str(sig.get('setup_label') or bd.get('Setup', '') or '')
     profile = _ai_strategy_profile(symbol, regime=regime, setup=setup)
 
-    global_live_count = len(get_live_trades(closed_only=True))
+    global_live_count = len(get_trend_live_trades(closed_only=True))
     if global_live_count < TREND_AI_SEMI_TRADES:
         phase = 'learning'
     elif global_live_count < TREND_AI_FULL_TRADES:
@@ -6200,7 +6294,7 @@ def scan_thread():
                         order_delay += 5  # 每筆單間隔5秒
 
             # 更新動態門檻
-            update_dynamic_threshold()
+            update_dynamic_threshold(top10)
 
             # 每10輪更新一次大盤分析（不等1小時）
             if STATE.get("scan_count", 0) % 10 == 1:
@@ -6511,11 +6605,14 @@ def api_state_legacy_shadow_1():
 
         # 補上動態門檻資訊
         with _DT_LOCK:
+            curr_thr = float(_DT.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
             s['threshold_info'] = {
-                "current":      _DT.get("current", 38),
-                "phase":        "嚴格" if _DT.get("current",38) >= 50 else "調降中" if _DT.get("current",38) < 38 else "預設",
-                "full_rounds":  _DT.get("full_rounds", 0),
-                "empty_rounds": _DT.get("empty_rounds", 0),
+                'current': curr_thr,
+                'phase': 'AI積極' if curr_thr <= 51 else 'AI均衡' if curr_thr <= 60 else 'AI保守',
+                'full_rounds': _DT.get('full_rounds', 0),
+                'empty_rounds': _DT.get('empty_rounds', 0),
+                'no_order_rounds': _DT.get('no_order_rounds', 0),
+                'ai_note': _DT.get('last_ai_note', ''),
             }
 
         return jsonify(s)
@@ -8110,16 +8207,90 @@ def api_ai_status():
 
 @app.route('/api/ai_db_stats')
 def api_ai_db_stats():
-    live_open = get_live_trades(closed_only=False, pool='all')
-    live_closed = get_live_trades(closed_only=True, pool='all')
-    return jsonify(build_ai_db_stats_payload(
-        live_open=live_open,
-        live_closed=live_closed,
-        ai_panel=AI_PANEL,
-        backtest_db=BACKTEST_DB,
-        ai_db=AI_DB,
-        reset_from=TREND_LEARNING_RESET_FROM,
-    ))
+    live_open_all = get_live_trades(closed_only=False, pool='all')
+    live_closed_all = get_live_trades(closed_only=True, pool='all')
+    live_closed_soft = get_live_trades(closed_only=True, pool='soft_live')
+    live_closed_trusted = get_live_trades(closed_only=True, pool='trusted_live')
+    live_closed_trend = get_trend_live_trades(closed_only=True)
+    quarantine_rows = get_live_trades(closed_only=True, pool='quarantine')
+    effective_rows = live_closed_trusted if live_closed_trusted else live_closed_soft if live_closed_soft else live_closed_trend
+
+    counts_by_symbol = {}
+    for t in effective_rows:
+        sym = str((t or {}).get('symbol') or '')
+        if sym:
+            counts_by_symbol[sym] = counts_by_symbol.get(sym, 0) + 1
+    strongest_local_count = max(counts_by_symbol.values()) if counts_by_symbol else 0
+    local_ready_symbols = sum(1 for c in counts_by_symbol.values() if c >= AI_MIN_SAMPLE_EFFECT)
+
+    effective_count = len(effective_rows)
+    if effective_count < TREND_AI_SEMI_TRADES:
+        ai_phase = 'learning'
+    elif effective_count < TREND_AI_FULL_TRADES:
+        ai_phase = 'semi'
+    else:
+        ai_phase = 'full'
+    ai_ready = bool(effective_count >= TREND_AI_FULL_TRADES and local_ready_symbols > 0)
+
+    def _avg_metric(rows, key, default=0.0):
+        vals = []
+        for r in rows:
+            try:
+                v = r.get(key, None)
+                if v is not None:
+                    vals.append(float(v or 0.0))
+            except Exception:
+                pass
+        return round(sum(vals) / max(len(vals), 1), 4) if vals else float(default)
+
+    latest_trade = dict((effective_rows[-1] if effective_rows else (live_closed_all[-1] if live_closed_all else {})) or {})
+    latest_payload = {
+        'exit_time': str(latest_trade.get('exit_time') or latest_trade.get('entry_time') or ''),
+        'source': str(latest_trade.get('source') or 'live_only'),
+        'setup': str(latest_trade.get('setup_label') or ((latest_trade.get('breakdown') or {}).get('Setup')) or ''),
+        'symbol': str(latest_trade.get('symbol') or ''),
+        'raw_pnl_pct': round(float(latest_trade.get('raw_pnl_pct', latest_trade.get('pnl_pct', 0)) or 0), 4),
+    }
+
+    recent_rows = effective_rows[-10:]
+    recent_pnls = [float(_trade_learn_metric(t) or 0.0) for t in recent_rows]
+    recent_ev_10 = round(sum(recent_pnls) / max(len(recent_pnls), 1), 4) if recent_pnls else 0.0
+    recent_fake_breakout_loss_count = sum(1 for t in recent_rows if float(_trade_learn_metric(t) or 0.0) < 0 and str(t.get('setup_label') or ((t.get('breakdown') or {}).get('Setup')) or '').lower().find('breakout') >= 0)
+
+    symbol_blocked_list = []
+    for sym in sorted(counts_by_symbol.keys()):
+        blocked, _note = _symbol_hard_block(sym)
+        if blocked:
+            symbol_blocked_list.append(sym)
+
+    payload = {
+        'ai_phase': ai_phase,
+        'ai_ready': ai_ready,
+        'avg_execution_integrity': _avg_metric(effective_rows, 'execution_integrity', 0.0),
+        'avg_exit_integrity': _avg_metric(effective_rows, 'exit_integrity', 0.0),
+        'avg_label_confidence': _avg_metric(effective_rows, 'label_confidence', 0.0),
+        'backtest_run_count': len((BACKTEST_DB.get('runs') or [])) if isinstance(BACKTEST_DB, dict) else 0,
+        'closed_live_count': len(live_closed_all),
+        'data_scope': 'live_only',
+        'last_learning': str((AI_PANEL.get('last_learning') or '-')),
+        'latest': latest_payload,
+        'local_ready_symbols': int(local_ready_symbols),
+        'mode': ai_phase,
+        'open_live_count': len(live_open_all),
+        'quarantine_count': len(quarantine_rows),
+        'recent_ev_10': recent_ev_10,
+        'recent_fake_breakout_loss_count': int(recent_fake_breakout_loss_count),
+        'recent_miss_good_trade_count': 0,
+        'recent_pnl_pct': round(sum(recent_pnls), 4) if recent_pnls else 0.0,
+        'soft_live_count': len(live_closed_soft),
+        'strongest_local_count': int(strongest_local_count),
+        'symbol_blocked_list': symbol_blocked_list,
+        'symbols': sorted(counts_by_symbol.keys()),
+        'trusted_live_count': len(live_closed_trusted),
+        'effective_live_count': int(effective_count),
+        'reset_from': TREND_LEARNING_RESET_FROM,
+    }
+    return jsonify(payload)
 
 
 @app.route('/api/ai_learning_recent')
