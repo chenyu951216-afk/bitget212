@@ -95,8 +95,9 @@ STRATEGY_CAPITAL_MIN_TRADES = DATASET_POLICY['strategy_capital_min_trades']  # �
 STRATEGY_BLOCK_MIN_TRADES = DATASET_POLICY['strategy_block_min_trades']   # 策略封鎖至少要 11 筆以上
 STRATEGY_BLOCK_MIN_WINRATE = DATASET_POLICY['strategy_block_min_winrate']# 策略勝率低於 45% 停止再下
 NEUTRAL_REGIME_BLOCK = DECISION_POLICY['neutral_regime_block']      # 中性盤預設不主動開新單
-LEARNING_DATASET_META = build_learning_dataset_meta(reset_from=env_or_blank('TREND_LEARNING_RESET_FROM', '2026-04-04 00:00:00'))
-TREND_LEARNING_RESET_FROM = LEARNING_DATASET_META.get('activated_from', '2026-04-04 00:00:00')  # 兼容舊邏輯，但實際由 dataset version 管理
+LEARNING_DATASET_META = build_learning_dataset_meta(reset_from=env_or_blank('TREND_LEARNING_RESET_FROM', ''))
+TREND_LEARNING_RESET_FROM = LEARNING_DATASET_META.get('activated_from', '') or None  # 舊資料先納入，待新版實單累積足夠後再切換
+LEGACY_BOOTSTRAP_MIN_NEW_TRADES = max(int(TREND_AI_FULL_TRADES or 50), 50)
 TREND_EARLY_EXIT_MIN_RUN = 1.20 # 平倉後若後續延續超過此幅度，視為可能太早出場
 TREND_EARLY_EXIT_MIN_EDGE = 0.35# 平倉後先回踩不超過這個比例，才算健康回踩後延續
 DECISION_PRIORITY_ORDER = list(DECISION_POLICY['decision_priority_order'])
@@ -1452,18 +1453,91 @@ def _parse_trade_time(trade):
                 pass
     return None
 
-def get_trend_live_trades(closed_only=False):
-    rows = get_live_trades(closed_only=closed_only)
+def _legacy_new_split(rows):
+    reset_raw = str(TREND_LEARNING_RESET_FROM or '').strip()
+    if not reset_raw:
+        return list(rows or []), []
     try:
-        reset_dt = datetime.strptime(TREND_LEARNING_RESET_FROM, "%Y-%m-%d %H:%M:%S")
+        reset_dt = datetime.strptime(reset_raw, "%Y-%m-%d %H:%M:%S")
     except Exception:
-        return rows
-    filtered = []
-    for t in rows:
+        return list(rows or []), []
+    new_rows, legacy_rows = [], []
+    for t in list(rows or []):
         trade_dt = _parse_trade_time(t)
         if trade_dt and trade_dt >= reset_dt:
-            filtered.append(t)
+            new_rows.append(t)
+        else:
+            legacy_rows.append(t)
+    return new_rows, legacy_rows
+
+def _legacy_trade_quality(trade):
+    metric = float(_trade_learn_metric(trade) or 0.0)
+    edge = float(_trade_edge_pct(trade) or 0.0)
+    rr = float(trade.get('rr_ratio') or trade.get('rr') or ((trade.get('breakdown') or {}).get('RR')) or 0.0)
+    result = str(trade.get('result') or '').lower()
+    score = 0.0
+    if result == 'win':
+        score += 1.3
+    elif result == 'loss':
+        score -= 1.1
+    score += max(min(metric / 1.8, 1.8), -1.8)
+    score += max(min(edge / 0.9, 0.9), -0.9)
+    score += max(min((rr - 1.15) * 0.9, 0.9), -0.9)
+    setup_mode = _normalize_setup_mode(trade.get('setup_label') or ((trade.get('breakdown') or {}).get('Setup')) or '')
+    if setup_mode == 'breakout' and result == 'loss':
+        score -= 0.35
+    return round(score, 4)
+
+def _filter_legacy_bootstrap_rows(legacy_rows, new_rows=None):
+    legacy_rows = list(legacy_rows or [])
+    new_rows = list(new_rows or [])
+    if not legacy_rows:
+        return []
+    if len(new_rows) >= LEGACY_BOOTSTRAP_MIN_NEW_TRADES:
+        return []
+    symbol_stats = {}
+    for t in legacy_rows:
+        sym = str(t.get('symbol') or '')
+        rec = symbol_stats.setdefault(sym, {'count': 0, 'win': 0, 'metric': 0.0})
+        rec['count'] += 1
+        if str(t.get('result') or '').lower() == 'win':
+            rec['win'] += 1
+        rec['metric'] += float(_trade_learn_metric(t) or 0.0)
+    filtered = []
+    quarantine = []
+    for t in legacy_rows:
+        sym = str(t.get('symbol') or '')
+        rec = symbol_stats.get(sym, {'count': 0, 'win': 0, 'metric': 0.0})
+        cnt = int(rec.get('count', 0) or 0)
+        wr = float(rec.get('win', 0) or 0) / max(cnt, 1)
+        avg_metric = float(rec.get('metric', 0.0) or 0.0) / max(cnt, 1)
+        q = _legacy_trade_quality(t)
+        if cnt >= 10 and wr < 0.34 and avg_metric < -0.18:
+            quarantine.append(t)
+            continue
+        if q <= -0.55:
+            quarantine.append(t)
+            continue
+        filtered.append(t)
+    try:
+        LEARNING_DATASET_META['legacy_bootstrap_filtered'] = len(filtered)
+        LEARNING_DATASET_META['legacy_bootstrap_quarantine'] = len(quarantine)
+        LEARNING_DATASET_META['legacy_bootstrap_mode'] = 'mixed' if len(new_rows) < LEGACY_BOOTSTRAP_MIN_NEW_TRADES else 'new_only'
+        LEARNING_DATASET_META['legacy_bootstrap_new_count'] = len(new_rows)
+    except Exception:
+        pass
     return filtered
+
+def get_trend_live_trades(closed_only=False):
+    rows = get_live_trades(closed_only=closed_only)
+    new_rows, legacy_rows = _legacy_new_split(rows)
+    if not legacy_rows:
+        return new_rows or rows
+    if len(new_rows) >= LEGACY_BOOTSTRAP_MIN_NEW_TRADES:
+        return new_rows
+    legacy_filtered = _filter_legacy_bootstrap_rows(legacy_rows, new_rows=new_rows)
+    merged = list(new_rows) + list(legacy_filtered)
+    return merged if merged else rows
 
 def _trade_learn_metric(trade):
     """AI learning metric: use account impact when available, otherwise fallback safely.
@@ -1604,13 +1678,17 @@ def _ui_trend_payload(symbol='', regime='neutral', setup=''):
         cont_rate = float(prof.get('continuation_rate', 0.0) or 0.0)
         count = int(prof.get('count', 0) or 0)
         intervene_ratio = float(prof.get('intervene_ratio', 0.0) or 0.0)
+        source = str(prof.get('source') or 'none')
+        source_bonus = {'local': 5.0, 'symbol': 4.0, 'regime': 2.5, 'global': 1.0}.get(source, 0.0)
         if stage == 'learning':
-            confidence = min(44.0, 18.0 + count * 0.8 + cont_rate * 18.0)
+            confidence = min(58.0, 14.0 + count * 1.05 + cont_rate * 22.0 + source_bonus + max(hold_bias, 0.0) * 9.0)
         elif stage == 'semi':
-            confidence = min(79.0, 45.0 + max(hold_bias, 0.0) * 22.0 + cont_rate * 20.0 + intervene_ratio * 8.0)
+            confidence = min(84.0, 34.0 + count * 0.38 + max(hold_bias, 0.0) * 26.0 + cont_rate * 24.0 + intervene_ratio * 10.0 + source_bonus)
         else:
-            confidence = min(96.0, 55.0 + max(hold_bias, 0.0) * 26.0 + cont_rate * 24.0 + intervene_ratio * 10.0)
-        hold_reason = 'trend_continuation' if hold_bias > 0 and stage in ('semi', 'full') else 'normal_manage'
+            confidence = min(97.0, 46.0 + count * 0.22 + max(hold_bias, 0.0) * 29.0 + cont_rate * 28.0 + intervene_ratio * 12.0 + source_bonus)
+        if hold_bias < -0.08:
+            confidence = max(12.0, confidence - min(18.0, abs(hold_bias) * 22.0))
+        hold_reason = 'trend_continuation' if hold_bias > 0.10 and stage in ('semi', 'full') else 'trend_caution' if hold_bias < -0.10 else 'normal_manage'
         mode_label = {'learning': 'learning', 'semi': 'partial', 'full': 'full'}.get(stage, 'learning')
         return {
             'trend_mode': mode_label,
@@ -2486,7 +2564,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             return 'main'
 
     def _compute_stats_from_rows(rows):
-        stats = weighted_trade_stats(rows, reset_from=TREND_LEARNING_RESET_FROM)
+        stats = weighted_trade_stats(rows, reset_from=None)
         if not stats:
             return {
                 "count": 0, "effective_count": 0.0, "win_rate": 0.0, "avg_pnl": 0.0, "ev_per_trade": 0.0,
@@ -2616,7 +2694,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'fallback_level': fallback_level,
             'quarantine_count': len(quarantine_rows),
             'ready': (
-                not sym_block and phase == 'full' and status in ('valid', 'observe') and conf >= 0.22
+                not sym_block and status in ('valid', 'observe') and ((phase == 'full' and conf >= 0.22) or (fallback_level in ('mid', 'global', 'global_session') and effective_count >= 12 and conf >= 0.16))
             ),
             'symbol_blocked': sym_block,
             'strategy_blocked': strat_block,
@@ -6091,7 +6169,17 @@ def scan_thread():
                     status="觀察中(勝率{}%)".format(sym_wr) if not allowed else ""
                     if abs(sc)>=8:
                         stable_score = smooth_signal_score(sym, sc)
-                        SIGNAL_META_CACHE[sym] = {"atr": atr, "atr15": atr15, "atr4h": atr4h, "price": pr, "raw_score": sc, "stable_score": stable_score, "updated_at": tw_now_str()}
+                        SIGNAL_META_CACHE[sym] = {
+                            "atr": atr, "atr15": atr15, "atr4h": atr4h, "price": pr,
+                            "raw_score": sc, "stable_score": stable_score, "updated_at": tw_now_str(), "ts": time.time(),
+                            "setup_label": bd.get("Setup", ""),
+                            "signal_grade": bd.get("等級", ""),
+                            "direction_confidence": bd.get("方向信心", 0),
+                            "entry_quality": bd.get("進場品質", 0),
+                            "rr_ratio": bd.get("RR", 0),
+                            "regime": bd.get("Regime", "neutral"),
+                            "regime_confidence": bd.get("RegimeConfidence", bd.get("方向信心", 0)),
+                        }
                         sigs.append({
                             "symbol":sym,"score":stable_score,"raw_score":sc,"desc":desc,"price":pr,
                             "stop_loss":sl,"take_profit":tp,"est_pnl":ep,
@@ -6111,6 +6199,9 @@ def scan_thread():
                             "setup_label": bd.get("Setup", ""),
                             "signal_grade": bd.get("等級", ""),
                             "direction_confidence": bd.get("方向信心", 0),
+                            "regime": bd.get("Regime", "neutral"),
+                            "regime_confidence": bd.get("RegimeConfidence", bd.get("方向信心", 0)),
+                            "trend_confidence": bd.get("TrendConfidence", bd.get("方向信心", 0)),
                             "score_jump": score_jump_alert(sym, sc, stable_score),
                         })
                 except Exception as sym_e:
@@ -6989,8 +7080,11 @@ def analyze_legacy_shadow_2(symbol):
             # 沒有明確觸發，維持觀察，不讓純方向分數硬進場
             base = 18 + direction_conf * 4
             capped = min(base, 34)
+            wait_quality = round(max(0.8, min(4.6, direction_conf * 0.42 + max(adx15 - 16.0, 0.0) * 0.05)), 2)
             return side * capped, '方向有但未到觸發位|等待回踩/突破確認', curr, 0, 0, 0, {
-                '方向信心': round(direction_conf,2), 'Setup':'等待觸發', '進場品質':0, 'RR':0, '等級':'D'
+                '方向信心': round(direction_conf,2), 'Setup':'等待觸發', '進場品質': wait_quality, 'RR':0, '等級':'D',
+                'TrendConfidence': round(max(0.0, min(direction_conf * 8.5 + max(adx4 - 15.0, 0.0) * 1.2, 99.0)), 1),
+                'RegimeConfidence': round(max(0.0, min(direction_conf * 7.2 + max(adx15 - 14.0, 0.0) * 1.0, 99.0)), 1),
             }, atr, atr15, atr4h, 2.0, 3.0
 
         setup_label = setup['setup_label']
@@ -7100,6 +7194,8 @@ def analyze_legacy_shadow_2(symbol):
         breakdown['進場品質'] = round(setup_q, 1)
         breakdown['RR'] = round(rr_ratio, 2)
         breakdown['Setup'] = setup_label
+        breakdown['TrendConfidence'] = round(max(0.0, min(direction_conf * 8.8 + setup_q * 3.5 - anti_chase_penalty * 0.9 - htf_penalty * 0.65, 99.0)), 1)
+        breakdown['RegimeConfidence'] = round(max(0.0, min(direction_conf * 7.6 + max(helper, -6) * 0.8 - htf_penalty * 0.55, 99.0)), 1)
         breakdown['RegimeBias'] = side * round(direction_conf, 2)
         breakdown['追價風險'] = -anti_chase_penalty if side > 0 else anti_chase_penalty
         breakdown['高階位階壓力'] = -htf_penalty if side > 0 else htf_penalty
@@ -8104,7 +8200,13 @@ def auto_backtest_thread():
 def memory_guard_thread():
     while True:
         try:
+            now_ts = time.time()
             with CACHE_LOCK:
+                for sym, meta in list(SIGNAL_META_CACHE.items()):
+                    ts = float((meta or {}).get('ts', 0) or 0) if isinstance(meta, dict) else 0.0
+                    if ts and now_ts - ts > 900:
+                        SIGNAL_META_CACHE.pop(sym, None)
+                        SCORE_CACHE.pop(sym, None)
                 for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS]:
                     prune_mapping(cache, max_size=500, prune_count=200)
             with PROTECTION_LOCK:
