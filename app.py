@@ -7573,6 +7573,210 @@ def api_ai_symbol_stats():
         'error': error,
     })
 
+
+def _api_limit(default=50, max_value=500):
+    try:
+        limit = int(request.args.get('limit', default))
+    except Exception:
+        limit = default
+    return max(1, min(limit, max_value))
+
+
+def _api_offset(default=0, max_value=5000):
+    try:
+        offset = int(request.args.get('offset', default))
+    except Exception:
+        offset = default
+    return max(0, min(offset, max_value))
+
+
+def _sqlite_fetch_dicts(query, params=()):
+    import sqlite3
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.route('/api/ai_full_learning')
+def api_ai_full_learning():
+    """完整學習資料，預設最近50筆，避免一次撈太大造成卡頓。"""
+    limit = _api_limit(default=50, max_value=500)
+    offset = _api_offset(default=0, max_value=5000)
+    rows, error = [], None
+    try:
+        rows = _sqlite_fetch_dicts(
+            """
+            SELECT trade_id, symbol, result, source, entry_time, exit_time, created_at, updated_at, data_json
+            FROM learning_trades
+            ORDER BY COALESCE(updated_at, created_at, exit_time, entry_time) DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        for row in rows:
+            raw = row.get('data_json')
+            try:
+                row['data_json'] = json.loads(raw) if raw else {}
+            except Exception:
+                row['data_json'] = raw
+    except Exception as e:
+        error = str(e)
+    return jsonify({'ok': error is None, 'limit': limit, 'offset': offset, 'count': len(rows), 'data': rows, 'error': error})
+
+
+@app.route('/api/trade_history')
+def api_trade_history_records():
+    """最近交易紀錄，從 SQLite trade_history 讀取。"""
+    limit = _api_limit(default=50, max_value=500)
+    offset = _api_offset(default=0, max_value=5000)
+    rows, error = [], None
+    try:
+        rows = _sqlite_fetch_dicts(
+            """
+            SELECT *
+            FROM trade_history
+            ORDER BY COALESCE(updated_at, created_at, exit_time, entry_time, time) DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        for row in rows:
+            if 'data_json' in row:
+                raw = row.get('data_json')
+                try:
+                    row['data_json'] = json.loads(raw) if raw else {}
+                except Exception:
+                    pass
+    except Exception as e:
+        error = str(e)
+    return jsonify({'ok': error is None, 'limit': limit, 'offset': offset, 'count': len(rows), 'data': rows, 'error': error})
+
+
+@app.route('/api/risk_logs')
+def api_risk_logs():
+    """最近風控事件紀錄。"""
+    limit = _api_limit(default=50, max_value=500)
+    offset = _api_offset(default=0, max_value=5000)
+    rows, error = [], None
+    try:
+        rows = _sqlite_fetch_dicts(
+            """
+            SELECT *
+            FROM risk_events
+            ORDER BY COALESCE(created_at, event_time, timestamp) DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        for row in rows:
+            if 'payload_json' in row:
+                raw = row.get('payload_json')
+                try:
+                    row['payload_json'] = json.loads(raw) if raw else {}
+                except Exception:
+                    pass
+    except Exception as e:
+        error = str(e)
+    return jsonify({'ok': error is None, 'limit': limit, 'offset': offset, 'count': len(rows), 'data': rows, 'error': error})
+
+
+@app.route('/api/audit_logs')
+def api_audit_logs():
+    """最近系統稽核/偵錯紀錄。"""
+    limit = _api_limit(default=50, max_value=500)
+    offset = _api_offset(default=0, max_value=5000)
+    rows, error = [], None
+    try:
+        rows = _sqlite_fetch_dicts(
+            """
+            SELECT *
+            FROM audit_logs
+            ORDER BY COALESCE(created_at, event_time, timestamp) DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        for row in rows:
+            if 'payload_json' in row:
+                raw = row.get('payload_json')
+                try:
+                    row['payload_json'] = json.loads(raw) if raw else {}
+                except Exception:
+                    pass
+    except Exception as e:
+        error = str(e)
+    return jsonify({'ok': error is None, 'limit': limit, 'offset': offset, 'count': len(rows), 'data': rows, 'error': error})
+
+
+@app.route('/api/backtest_runs')
+def api_backtest_runs():
+    """最近回測紀錄。"""
+    limit = _api_limit(default=30, max_value=200)
+    offset = _api_offset(default=0, max_value=2000)
+    rows, error = [], None
+    try:
+        rows = _sqlite_fetch_dicts(
+            """
+            SELECT *
+            FROM backtest_runs
+            ORDER BY COALESCE(created_at, run_time, timestamp) DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        for row in rows:
+            for key in ('payload_json', 'summary_json', 'result_json', 'data_json'):
+                if key in row:
+                    raw = row.get(key)
+                    try:
+                        row[key] = json.loads(raw) if raw else {}
+                    except Exception:
+                        pass
+    except Exception as e:
+        error = str(e)
+    return jsonify({'ok': error is None, 'limit': limit, 'offset': offset, 'count': len(rows), 'data': rows, 'error': error})
+
+
+@app.route('/api/ai_debug_last_decision')
+def api_ai_debug_last_decision():
+    """快速看最近自動下單/未下單原因，不改動主流程，只讀取快取狀態。"""
+    try:
+        with AUDIT_LOCK:
+            audit_map = snapshot_mapping(AUTO_ORDER_AUDIT)
+        with _DT_LOCK:
+            threshold_state = dict(_DT)
+        payload = {
+            'ok': True,
+            'threshold': {
+                'current': threshold_state.get('current', ORDER_THRESHOLD),
+                'default': ORDER_THRESHOLD_DEFAULT,
+                'high': ORDER_THRESHOLD_HIGH,
+                'floor': ORDER_THRESHOLD_FLOOR,
+                'drop': ORDER_THRESHOLD_DROP,
+                'state': threshold_state,
+            },
+            'risk_status': get_risk_status(),
+            'market_info': dict(MARKET_STATE),
+            'session_info': dict(SESSION_STATE),
+            'auto_order_audit': audit_map,
+            'symbols': sorted(list(audit_map.keys())),
+            'count': len(audit_map),
+            'updated_at': tw_now_str('%Y-%m-%d %H:%M:%S'),
+        }
+        symbol = str(request.args.get('symbol') or '').strip()
+        if symbol:
+            payload['symbol'] = symbol
+            payload['decision'] = audit_map.get(symbol)
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 def api_state_enhanced():
     resp = _BASE_API_STATE()
     try:
