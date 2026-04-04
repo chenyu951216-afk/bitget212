@@ -4241,6 +4241,21 @@ def analyze_legacy_shadow_1(symbol):
             breakdown['方向衝突'] = 8
             tags.append('空分數但方向衝突')
 
+        # 先依既有邏輯推導當前方向的 SL / TP，避免未初始化直接計算 RR
+        if score > 0:
+            sl = round(curr - atr * sl_mult, 6)
+            tp = round(curr + atr * tp_mult, 6)
+        else:
+            sl = round(curr + atr * sl_mult, 6)
+            tp = round(curr - atr * tp_mult, 6)
+
+        # ✅ 防呆（不影響策略）
+        if 'tp' not in locals() or tp is None:
+            return 0, '錯誤:no_tp', 0, 0, 0, 0, {'valid': False, 'reason': 'no_tp_sl'}, 0, 0, 0, 2.0, 3.0
+
+        if 'sl' not in locals() or sl is None:
+            return 0, '錯誤:no_sl', 0, 0, 0, 0, {'valid': False, 'reason': 'no_tp_sl'}, 0, 0, 0, 2.0, 3.0
+
         # 報酬風險比過低直接降權
         rr_ratio = abs(tp - curr) / max(abs(curr - sl), 1e-9)
         if rr_ratio < 1.35:
@@ -4274,14 +4289,6 @@ def analyze_legacy_shadow_1(symbol):
             score *= 0.7
             tags.append("逆4H趨勢降權")
             breakdown['4H趨勢不順'] = 6
-
-        # ===== 用 15m ATR 算 SL / TP =====
-        if score > 0:
-            sl = round(curr - atr * sl_mult, 6)
-            tp = round(curr + atr * tp_mult, 6)
-        else:
-            sl = round(curr + atr * sl_mult, 6)
-            tp = round(curr - atr * tp_mult, 6)
 
         ep = round((atr * tp_mult) / curr * 100 * 20, 2)
         score = min(max(round(score, 1), -100), 100)
