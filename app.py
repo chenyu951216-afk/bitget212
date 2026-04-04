@@ -6187,7 +6187,7 @@ def scan_thread():
                             "raw_score": sc, "stable_score": stable_score, "updated_at": tw_now_str(), "ts": time.time(),
                             "setup_label": bd.get("Setup", ""),
                             "signal_grade": bd.get("等級", ""),
-                            "direction_confidence": bd.get("方向信心", bd.get("TrendConfidence", 0)),
+                            "direction_confidence": (lambda _dc, _tc: round(float(_dc if _dc not in (None, '', 0, 0.0) else float(_tc or 0) / 10.0), 1))(bd.get("方向信心"), bd.get("TrendConfidence", 0)),
                             "entry_quality": bd.get("進場品質", 0),
                             "rr_ratio": bd.get("RR", 0),
                             "regime": bd.get("Regime", "neutral"),
@@ -6211,7 +6211,7 @@ def scan_thread():
                             "regime_bias": bd.get("RegimeBias", 0),
                             "setup_label": bd.get("Setup", ""),
                             "signal_grade": bd.get("等級", ""),
-                            "direction_confidence": bd.get("方向信心", bd.get("TrendConfidence", 0)),
+                            "direction_confidence": (lambda _dc, _tc: round(float(_dc if _dc not in (None, '', 0, 0.0) else float(_tc or 0) / 10.0), 1))(bd.get("方向信心"), bd.get("TrendConfidence", 0)),
                             "regime": bd.get("Regime", "neutral"),
                             "regime_confidence": bd.get("RegimeConfidence", bd.get("TrendConfidence", bd.get("方向信心", 0))),
                             "trend_confidence": bd.get("TrendConfidence", bd.get("方向信心", 0)),
@@ -7046,22 +7046,26 @@ def _direction_profile_v6(d15, d4h, d1d):
 
 
 def _grade_signal_v6(direction_conf, setup_q, rr, anti_chase_penalty, htf_penalty):
-    """統一等級判定，和實際 entry_quality / RR gating 更貼近，避免整排長期卡在 C。"""
+    """統一等級判定，偏向反映可交易性而非過度保守，避免整排被壓成 C。"""
     dc = max(0.0, min(float(direction_conf or 0.0), 10.0))
     sq = max(0.0, min(float(setup_q or 0.0), 10.0))
     rrv = max(0.0, min(float(rr or 0.0), 3.0))
     anti = max(0.0, float(anti_chase_penalty or 0.0))
     htf = max(0.0, float(htf_penalty or 0.0))
-    composite = dc * 3.6 + sq * 5.2 + rrv * 4.8 - anti * 0.85 - htf * 0.75
-    if sq >= 7.4 and rrv >= 2.2 and dc >= 6.2 and composite >= 69:
+
+    tradability = sq * 6.0 + min(rrv, 2.6) * 5.1 + dc * 4.1
+    penalty = anti * 0.28 + htf * 0.22
+    composite = tradability - penalty
+
+    if sq >= 7.2 and rrv >= 2.2 and dc >= 4.8 and composite >= 60:
         return 'A+'
-    if sq >= 6.7 and rrv >= 1.9 and dc >= 5.4 and composite >= 60:
+    if sq >= 6.2 and rrv >= 1.9 and dc >= 3.8 and composite >= 52:
         return 'A'
-    if sq >= 5.8 and rrv >= 1.6 and dc >= 4.6 and composite >= 52:
+    if sq >= 5.2 and rrv >= 1.55 and dc >= 2.4 and composite >= 43:
         return 'B+'
-    if sq >= 4.8 and rrv >= 1.4 and dc >= 3.8 and composite >= 44:
+    if sq >= 4.1 and rrv >= 1.3 and composite >= 34:
         return 'B'
-    if sq >= 3.2 and rrv >= 1.15 and composite >= 34:
+    if sq >= 2.6 and rrv >= 1.1 and composite >= 25:
         return 'C'
     return 'D'
 
@@ -7103,9 +7107,10 @@ def analyze_legacy_shadow_2(symbol):
             wait_quality = round(max(1.2, min(5.2, direction_conf_view * 0.38 + max(adx15 - 16.0, 0.0) * 0.06)), 2)
             wait_trend_conf = round(max(0.0, min(direction_conf_view * 9.2 + max(adx4 - 15.0, 0.0) * 1.2, 99.0)), 1)
             wait_regime_conf = round(max(0.0, min(direction_conf_view * 8.0 + max(adx15 - 14.0, 0.0) * 1.0, 99.0)), 1)
-            wait_grade = _grade_signal_v6(direction_conf_view, wait_quality, 1.0, 0, 0)
+            wait_grade = _grade_signal_v6(max(direction_conf_view, wait_trend_conf / 10.0), wait_quality, 1.0, 0, 0)
+            wait_direction = round(max(direction_conf_view, wait_trend_conf / 10.0, wait_regime_conf / 11.5), 1)
             return side * capped, '方向有但未到觸發位|等待回踩/突破確認', curr, 0, 0, 0, {
-                '方向信心': round(direction_conf_view,1), 'Setup':'等待觸發', '進場品質': wait_quality, 'RR':0, '等級':wait_grade,
+                '方向信心': wait_direction, 'Setup':'等待觸發', '進場品質': wait_quality, 'RR':0, '等級':wait_grade,
                 'TrendConfidence': wait_trend_conf,
                 'RegimeConfidence': wait_regime_conf,
             }, atr, atr15, atr4h, 2.0, 3.0
@@ -7217,8 +7222,13 @@ def analyze_legacy_shadow_2(symbol):
         breakdown['進場品質'] = round(setup_q, 1)
         breakdown['RR'] = round(rr_ratio, 2)
         breakdown['Setup'] = setup_label
-        breakdown['TrendConfidence'] = round(max(0.0, min(direction_conf_view * 9.0 + setup_q * 4.2 - anti_chase_penalty * 0.85 - htf_penalty * 0.6, 99.0)), 1)
-        breakdown['RegimeConfidence'] = round(max(0.0, min(direction_conf_view * 7.8 + max(helper, -6) * 1.05 - htf_penalty * 0.45, 99.0)), 1)
+        trend_conf_val = round(max(0.0, min(direction_conf_view * 9.0 + setup_q * 4.2 - anti_chase_penalty * 0.85 - htf_penalty * 0.6, 99.0)), 1)
+        regime_conf_val = round(max(0.0, min(direction_conf_view * 7.8 + max(helper, -6) * 1.05 - htf_penalty * 0.45, 99.0)), 1)
+        if direction_conf_view <= 0.2:
+            direction_conf_view = max(direction_conf_view, trend_conf_val / 10.5, regime_conf_val / 11.5)
+        breakdown['方向信心'] = round(max(direction_conf_view, 0.0), 1)
+        breakdown['TrendConfidence'] = trend_conf_val
+        breakdown['RegimeConfidence'] = regime_conf_val
         breakdown['RegimeBias'] = side * round(direction_conf_view, 2)
         breakdown['追價風險'] = -anti_chase_penalty if side > 0 else anti_chase_penalty
         breakdown['高階位階壓力'] = -htf_penalty if side > 0 else htf_penalty
