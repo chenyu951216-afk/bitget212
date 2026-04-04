@@ -2573,10 +2573,13 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
         return stats
 
     try:
-        all_rows = get_live_trades(closed_only=True, pool='trusted_live')
-        soft_rows = get_live_trades(closed_only=True, pool='soft_live')
+        bootstrap_rows = get_trend_live_trades(closed_only=True)
         trusted_rows = get_live_trades(closed_only=True, pool='trusted_live')
+        soft_rows = get_live_trades(closed_only=True, pool='soft_live')
         quarantine_rows = get_live_trades(closed_only=True, pool='quarantine')
+        all_rows = list(bootstrap_rows or trusted_rows or soft_rows or [])
+        if not all_rows:
+            all_rows = get_live_trades(closed_only=True, pool='all')
         symbol = str(symbol or '')
         regime = str(regime or 'neutral')
         fit_ok, fit_note = _regime_setup_fit(regime, setup)
@@ -2690,6 +2693,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
             'global_count': global_cnt,
             'soft_live_count': len(soft_rows),
             'trusted_live_count': len(trusted_rows),
+            'bootstrap_live_count': len(all_rows),
             'strongest_local_count': max(local_cnt, trusted_local_cnt),
             'fallback_level': fallback_level,
             'quarantine_count': len(quarantine_rows),
@@ -2703,7 +2707,7 @@ def _ai_strategy_profile(symbol, regime='neutral', setup=''):
 
         notes = [f'三層回退:{fallback_desc}', f'依據:{fallback_detail}', f'當前時段:{current_session_bucket}']
         notes.append(f'局部{local_cnt}｜中層{mid_cnt}｜全域{global_cnt}')
-        notes.append(f'可信局部{trusted_local_cnt}｜soft{len(soft_rows)}｜隔離{len(quarantine_rows)}')
+        notes.append(f'可信局部{trusted_local_cnt}｜bootstrap{len(all_rows)}｜soft{len(soft_rows)}｜隔離{len(quarantine_rows)}')
         notes.append(f'phase:{phase}')
         notes.append(f'有效樣本{effective_count:.1f}')
 
@@ -5912,6 +5916,15 @@ def place_order(sig):
         _gate = apply_execution_guard(sym, side, margin_pct)
         sig['execution_quality'] = dict(_gate.get('snapshot') or {})
         sig['execution_gate'] = dict(_gate.get('gate') or {})
+        _gate_penalty = float((sig.get('execution_gate') or {}).get('score_penalty', 0.0) or 0.0)
+        if _gate_penalty > 0:
+            try:
+                sig['score'] = round(float(sig.get('score', 0) or 0) - _gate_penalty, 2)
+                bd_penalty = dict(sig.get('breakdown') or {})
+                bd_penalty['執行風險扣分'] = -round(_gate_penalty, 2)
+                sig['breakdown'] = bd_penalty
+            except Exception:
+                pass
         if not _gate.get('allow', True):
             print('送單前最後守門阻擋 {}: {}'.format(sym, (_gate.get('gate') or {}).get('reasons')))
             append_audit_log('execution_guard', '送單前最後守門阻擋', {'symbol': sym, 'side': side, 'gate': _gate})
@@ -8916,6 +8929,19 @@ def ensure_exchange_protection(sym, side, pos_side, qty, sl_price, tp_price, ver
         PROTECTION_FAIL_STREAK = 0
     return sl_ok, tp_ok
 
+def _is_soft_execution_pause(gate):
+    try:
+        gate = dict(gate or {})
+        reasons = [str(x) for x in (gate.get('reasons') or [])]
+        joined = ' | '.join(reasons).lower()
+        hard_words = ['api', 'timeout', 'offline', 'network', 'schema', 'error', '保護單', 'maintenance', '停機', 'stale']
+        soft_words = ['深度過薄', 'depth', 'spread', '滑價', '薄', 'liquidity', 'orderbook']
+        if any(w in joined for w in hard_words):
+            return False
+        return any(w.lower() in joined for w in soft_words)
+    except Exception:
+        return False
+
 def apply_execution_guard(symbol, side, margin_pct):
     global API_ERROR_STREAK
     try:
@@ -8926,6 +8952,17 @@ def apply_execution_guard(symbol, side, margin_pct):
             API_ERROR_STREAK = max(API_ERROR_STREAK - 1, 0)
         gate = execution_gate(snap, api_error_streak=API_ERROR_STREAK)
         if gate.get('action') == 'pause':
+            if _is_soft_execution_pause(gate):
+                softened_gate = dict(gate or {})
+                softened_gate['action'] = 'penalty'
+                softened_gate['softened'] = True
+                softened_gate['score_penalty'] = max(float(softened_gate.get('score_penalty', 0.0) or 0.0), 6.0)
+                reasons = list(softened_gate.get('reasons') or [])
+                if '深度偏薄，改扣分降倉處理' not in reasons:
+                    reasons.append('深度偏薄，改扣分降倉處理')
+                softened_gate['reasons'] = reasons
+                mp = float(margin_pct or 0) * min(float(softened_gate.get('margin_mult', 1.0) or 1.0), 0.42)
+                return {'allow': True, 'margin_pct': mp, 'snapshot': snap, 'gate': softened_gate}
             return {'allow': False, 'margin_pct': margin_pct, 'snapshot': snap, 'gate': gate}
         mp = float(margin_pct or 0) * float(gate.get('margin_mult', 1.0) or 1.0)
         return {'allow': True, 'margin_pct': mp, 'snapshot': snap, 'gate': gate}
