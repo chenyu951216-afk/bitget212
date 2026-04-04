@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crypto Trading Bot Dashboard · Neon Vision</title>
+  <style>
+    :root{
+      --bg:#040817;--bg2:#071126;--panel:rgba(8,18,42,.78);--panel2:rgba(10,25,58,.82);--line:rgba(98,150,255,.18);
+      --text:#e8f3ff;--muted:#8ea7c8;--cyan:#61e8ff;--blue:#4f8cff;--violet:#8b5cff;--green:#2de39a;--red:#ff6e9a;--yellow:#ffd46c;
+      --shadow:0 18px 50px rgba(0,0,0,.32);--blur:14px;--radius:24px;
+    }
+    *{box-sizing:border-box}html,body{height:100%}
+    body{
+      margin:0;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);
+      background:
+        radial-gradient(circle at 12% 18%, rgba(69,115,255,.22), transparent 24%),
+        radial-gradient(circle at 80% 20%, rgba(87,236,255,.14), transparent 18%),
+        radial-gradient(circle at 70% 78%, rgba(139,92,255,.16), transparent 22%),
+        linear-gradient(180deg,#030712,#040a18 30%,#050d1f 100%);
+      overflow-x:hidden;
+    }
+    body::before{
+      content:"";position:fixed;inset:0;pointer-events:none;opacity:.28;
+      background-image:linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+      background-size:48px 48px;
+      mask-image:linear-gradient(180deg,rgba(255,255,255,.9),rgba(255,255,255,.1));
+    }
+    .app-shell{display:grid;grid-template-columns:300px 1fr;min-height:100vh}
+    .mobile-menu-btn{display:none;align-items:center;gap:8px;padding:11px 14px;border-radius:16px;border:1px solid rgba(113,165,255,.18);background:rgba(255,255,255,.04);color:var(--text);font-weight:800;cursor:pointer}
+    .sidebar-overlay{display:none}
+    @media (max-width:1180px){
+      .app-shell{grid-template-columns:1fr}
+      .mobile-menu-btn{display:inline-flex}
+      .sidebar{
+        position:fixed;left:0;top:0;bottom:0;width:min(86vw,340px);z-index:60;overflow:auto;
+        transform:translateX(-105%);transition:transform .22s ease;
+      }
+      body.sidebar-open .sidebar{transform:translateX(0)}
+      .sidebar-overlay{display:block;position:fixed;inset:0;background:rgba(2,7,20,.55);backdrop-filter:blur(3px);z-index:50;opacity:0;pointer-events:none;transition:opacity .2s ease}
+      body.sidebar-open .sidebar-overlay{opacity:1;pointer-events:auto}
+      .main{padding:14px}
+    }
+    .sidebar{
+      padding:20px 16px;border-right:1px solid rgba(122,165,255,.12);backdrop-filter:blur(var(--blur));
+      background:linear-gradient(180deg,rgba(7,14,34,.92),rgba(4,10,26,.88));
+    }
+    .brand{padding:18px;border-radius:26px;background:linear-gradient(180deg,rgba(11,27,64,.88),rgba(8,19,48,.74));border:1px solid var(--line);box-shadow:var(--shadow)}
+    .brand .eyebrow{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:#88a7ff}
+    .brand h1{margin:10px 0 6px;font-size:26px;line-height:1.05}
+    .brand p{margin:0;color:var(--muted);font-size:13px;line-height:1.6}
+    .nav{display:flex;flex-direction:column;gap:10px;margin-top:18px}
+    .nav-btn{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:14px 16px;border-radius:18px;border:1px solid transparent;
+      background:rgba(255,255,255,.03);color:var(--text);cursor:pointer;transition:.2s ease;font-weight:700
+    }
+    .nav-btn:hover,.nav-btn.active{background:linear-gradient(90deg,rgba(79,140,255,.16),rgba(97,232,255,.08));border-color:rgba(97,232,255,.18);box-shadow:0 0 0 1px rgba(97,232,255,.08) inset}
+    .nav-label{display:flex;flex-direction:column;align-items:flex-start}.nav-label small{color:var(--muted);font-size:11px;font-weight:500}
+    .sidebar-card{margin-top:18px;padding:16px;border-radius:22px;background:linear-gradient(180deg,rgba(11,22,53,.82),rgba(7,16,37,.76));border:1px solid var(--line);box-shadow:var(--shadow)}
+    .sidebar-card h3{margin:0 0 12px;font-size:13px;color:#b6d6ff;letter-spacing:.08em;text-transform:uppercase}
+    .mini-kv{display:grid;gap:10px}.mini-kv .item{padding:10px 12px;border-radius:16px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05)}
+    .mini-kv .k{font-size:11px;color:var(--muted)}.mini-kv .v{margin-top:4px;font-size:16px;font-weight:800}
+    .main{padding:20px}
+    .topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}@media (max-width:760px){.top-actions{flex-wrap:nowrap;overflow:auto;max-width:100%;padding-bottom:4px}.pill,.btn,.ghost,.mobile-menu-btn{flex:0 0 auto}.top-title h2{font-size:24px}}
+    .top-title h2{margin:0;font-size:30px}.top-title p{margin:6px 0 0;color:var(--muted);font-size:13px}
+    .top-actions{display:flex;gap:10px;flex-wrap:wrap}
+    .pill,.btn,.ghost{
+      display:inline-flex;align-items:center;gap:8px;padding:11px 14px;border-radius:999px;border:1px solid rgba(113,165,255,.16);font-weight:700;text-decoration:none
+    }
+    .pill{background:rgba(255,255,255,.04);color:#c9dbff}.btn{background:linear-gradient(90deg,rgba(79,140,255,.2),rgba(97,232,255,.14));color:var(--text);cursor:pointer}
+    .ghost{background:rgba(255,255,255,.03);color:var(--text);cursor:pointer}
+    .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px}
+    .panel{
+      position:relative;overflow:hidden;padding:18px;border-radius:var(--radius);background:linear-gradient(180deg,var(--panel),var(--panel2));
+      border:1px solid var(--line);box-shadow:var(--shadow);backdrop-filter:blur(var(--blur));
+    }
+    .panel::before{content:"";position:absolute;inset:auto -30% 60% auto;width:220px;height:220px;background:radial-gradient(circle,rgba(97,232,255,.18),transparent 65%);pointer-events:none}
+    .span-12{grid-column:span 12}.span-8{grid-column:span 8}.span-7{grid-column:span 7}.span-6{grid-column:span 6}.span-5{grid-column:span 5}.span-4{grid-column:span 4}.span-3{grid-column:span 3}
+    @media (max-width:1200px){.span-8,.span-7,.span-6,.span-5,.span-4,.span-3{grid-column:span 12}}
+    .section{display:none}.section.active{display:block}
+    .section-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+    .section-head h3,.panel h3{margin:0;font-size:16px}.section-head p,.panel .sub{margin:6px 0 0;color:var(--muted);font-size:12px}
+    .metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+    @media (max-width:900px){.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    .metric{padding:16px;border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.06)}
+    .metric .label{font-size:12px;color:var(--muted);margin-bottom:8px}.metric .val{font-size:30px;font-weight:900;line-height:1}.metric .sub{font-size:12px;color:var(--muted);margin-top:8px}
+    .signal-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}@media (max-width:1280px){.signal-list{grid-template-columns:1fr}}
+    .signal{padding:16px;border-radius:22px;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.06)}
+    .signal.long{box-shadow:inset 3px 0 0 rgba(45,227,154,.72)}.signal.short{box-shadow:inset 3px 0 0 rgba(255,110,154,.78)}
+    .row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.symbol{font-size:21px;font-weight:900}.score{font-size:28px;font-weight:900}
+    .badges{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.badge{padding:6px 10px;border-radius:999px;font-size:12px;color:#cfe0ff;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.07)}
+    .badge.good{background:rgba(45,227,154,.14);border-color:rgba(45,227,154,.28);color:#9bf3c8}.badge.warn{background:rgba(255,212,108,.14);border-color:rgba(255,212,108,.24);color:#ffe5a4}.badge.danger{background:rgba(255,110,154,.15);border-color:rgba(255,110,154,.25);color:#ffc4d5}
+    .badge.gradeA{background:rgba(45,227,154,.14);border-color:rgba(45,227,154,.3);color:#9af3c4}.badge.gradeB{background:rgba(255,212,108,.14);border-color:rgba(255,212,108,.26);color:#ffe39c}.badge.gradeC{background:rgba(255,110,154,.15);border-color:rgba(255,110,154,.22);color:#ffc6d7}
+    .kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:12px}@media (max-width:760px){.kv{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    .kv .item{padding:11px 12px;border-radius:16px;background:rgba(4,11,28,.7);border:1px solid rgba(255,255,255,.05)}.kv .k{font-size:11px;color:var(--muted)}.kv .v{font-size:15px;font-weight:800;margin-top:4px}
+    .desc{font-size:12px;color:#cfe0ff;line-height:1.65;margin-top:10px}
+    .muted{color:var(--muted)}.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}.blue{color:var(--cyan)}
+    .trend-ring{position:relative;width:180px;height:180px;border-radius:50%;display:grid;place-items:center;margin:auto;background:conic-gradient(var(--cyan) 0deg, var(--blue) var(--ring,180deg), rgba(255,255,255,.08) var(--ring,180deg), rgba(255,255,255,.08) 360deg)}
+    .trend-ring::after{content:"";position:absolute;inset:14px;border-radius:50%;background:linear-gradient(180deg,rgba(5,15,36,.95),rgba(4,10,26,.92));border:1px solid rgba(255,255,255,.06)}
+    .trend-ring .inner{position:relative;z-index:1;text-align:center}.trend-ring .inner .big{font-size:34px;font-weight:900}.trend-ring .inner .small{margin-top:5px;font-size:12px;color:var(--muted)}
+    .table{width:100%;border-collapse:collapse}.table th,.table td{padding:12px 10px;border-bottom:1px solid rgba(255,255,255,.06);font-size:13px;text-align:left}.table th{color:var(--muted);font-weight:600}
+    .history{display:flex;flex-direction:column;gap:10px}.hist{padding:12px 14px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);display:flex;gap:10px;flex-wrap:wrap;font-size:13px}
+    .progress{height:10px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);overflow:hidden}.progress>div{height:100%;background:linear-gradient(90deg,var(--cyan),var(--blue));border-radius:999px}
+    .toolbar{display:flex;gap:10px;flex-wrap:wrap}.toolbar button{border:0;border-radius:14px;padding:10px 14px;background:rgba(255,255,255,.07);color:var(--text);cursor:pointer;font-weight:700}
+    .toolbar button.danger{background:rgba(255,110,154,.18);color:#ffd8e4}.toolbar button.primary{background:linear-gradient(90deg,rgba(79,140,255,.24),rgba(97,232,255,.16))}
+    .insight-card{padding:14px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)}
+    .insight-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:16px}@media (max-width:1180px){.insight-grid{grid-template-columns:1fr}}
+    .mini-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}@media (max-width:760px){.mini-grid{grid-template-columns:1fr}}
+    .mini-grid .item{padding:12px;border-radius:16px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)}
+    .seg{display:inline-flex;padding:4px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);gap:4px}.seg button{border:0;background:transparent;color:var(--muted);padding:8px 12px;border-radius:999px;cursor:pointer;font-weight:700}.seg button.active{background:rgba(97,232,255,.16);color:var(--text)}
+    pre{white-space:pre-wrap;word-break:break-word;margin:0;font-family:inherit;color:#d7e6ff;line-height:1.6}
+  </style>
+</head>
+<body>
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="eyebrow">Vision Quantum UI</div>
+        <h1>Crypto AI Bot</h1>
+        <p>科幻炫泡儀表板風格，保留原本交易、風控、AI、回測與學習功能，不加重前端負擔。</p>
+      </div>
+      <div class="nav">
+        <button class="nav-btn active" data-section="overview"><span class="nav-label">總覽中心<small>Overview Core</small></span><span>01</span></button>
+        <button class="nav-btn" data-section="signals"><span class="nav-label">候選信號<small>Signals Board</small></span><span>02</span></button>
+        <button class="nav-btn" data-section="positions"><span class="nav-label">持倉監控<small>Positions & Orders</small></span><span>03</span></button>
+        <button class="nav-btn" data-section="ai"><span class="nav-label">AI 實驗室<small>Learning & Backtest</small></span><span>04</span></button>
+      </div>
+      <div class="sidebar-card">
+        <h3>Trend Pilot</h3>
+        <div class="mini-kv">
+          <div class="item"><div class="k">趨勢模式</div><div class="v" id="sidebar-trend-mode">--</div></div>
+          <div class="item"><div class="k">續抱理由</div><div class="v" id="sidebar-hold-reason">--</div></div>
+          <div class="item"><div class="k">趨勢信心</div><div class="v" id="sidebar-trend-confidence">--</div></div>
+        </div>
+      </div>
+      <div class="sidebar-card">
+        <h3>Runtime Status</h3>
+        <div class="mini-kv">
+          <div class="item"><div class="k">最後更新</div><div class="v" id="last-update">--</div></div>
+          <div class="item"><div class="k">掃描進度</div><div class="v" id="scan-progress">--</div></div>
+          <div class="item"><div class="k">風控狀態</div><div class="v" id="risk-flag-side">正常</div></div>
+        </div>
+      </div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <button class="mobile-menu-btn" id="mobile-menu-btn" type="button">☰ 功能選單</button>
+        <div class="top-title">
+          <h2>Neon Vision Dashboard</h2>
+          <p>依功能切換介面，保留原資料顯示與操作按鈕，新增趨勢判斷狀態、續抱理由、趨勢信心。</p>
+        </div>
+        <div class="top-actions">
+          <div class="pill">AI 模式 <span id="ai-mode">--</span></div>
+          <div class="pill">Live 實單 <span id="ai-live-count">0</span></div>
+          <div class="pill">趨勢模式 <span id="trend-mode-pill">--</span></div>
+          <button class="btn" onclick="refresh()">立即刷新</button>
+        </div>
+      </div>
+
+      <section class="section active" id="section-overview">
+        <div class="grid">
+          <div class="panel span-12">
+            <div class="metric-grid">
+              <div class="metric"><div class="label">帳戶總資產</div><div class="val" id="equity">0</div><div class="sub">USDT</div></div>
+              <div class="metric"><div class="label">累積損益</div><div class="val" id="total-pnl">0</div><div class="sub">即時更新</div></div>
+              <div class="metric"><div class="label">動態門檻</div><div class="val yellow" id="threshold">50</div><div class="sub" id="threshold-phase">預設</div></div>
+              <div class="metric"><div class="label">風控狀態</div><div class="val" id="risk-flag">正常</div><div class="sub" id="risk-note">--</div><div style="margin-top:10px"><button class="ghost" id="risk-release-btn" onclick="releaseRiskOverride()">解除風控暫停</button></div></div>
+            </div>
+          </div>
+
+          <div class="panel span-7">
+            <div class="section-head"><div><h3>趨勢學習核心</h3><p>30 筆後半介入，50 筆後全介入；避免小回撤就馬上平倉又重下。</p></div></div>
+            <div class="insight-grid">
+              <div class="insight-card">
+                <div class="trend-ring" id="trend-ring"><div class="inner"><div class="big" id="trend-confidence-big">0%</div><div class="small">Trend Confidence</div></div></div>
+              </div>
+              <div style="display:grid;gap:12px">
+                <div class="mini-grid">
+                  <div class="item"><div class="k">trend_mode</div><div class="v" id="trend-mode">learning</div></div>
+                  <div class="item"><div class="k">hold_reason</div><div class="v" id="hold-reason">normal_manage</div></div>
+                  <div class="item"><div class="k">樣本數</div><div class="v" id="trend-sample-count">0</div></div>
+                </div>
+                <div class="mini-grid">
+                  <div class="item"><div class="k">延續率</div><div class="v" id="trend-cont-rate">0%</div></div>
+                  <div class="item"><div class="k">平均延續幅度</div><div class="v" id="trend-run-avg">0%</div></div>
+                  <div class="item"><div class="k">平均回踩</div><div class="v" id="trend-pullback-avg">0%</div></div>
+                </div>
+                <div class="insight-card">
+                  <div class="k">趨勢學習註記</div>
+                  <div class="desc" id="trend-note">等待資料...</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel span-5">
+            <div class="section-head"><div><h3>市場 / 新聞 / 學習摘要</h3><p>保留原本總覽資料，換成科幻面板樣式。</p></div></div>
+            <div class="kv">
+              <div class="item"><div class="k">BTC 大盤</div><div class="v" id="market-direction">--</div></div>
+              <div class="item"><div class="k">市場型態</div><div class="v" id="market-pattern">--</div></div>
+              <div class="item"><div class="k">新聞情緒</div><div class="v" id="news-sentiment">--</div></div>
+              <div class="item"><div class="k">新聞分數</div><div class="v" id="news-score">0</div></div>
+              <div class="item"><div class="k">實單總數</div><div class="v" id="learn-total">0</div></div>
+              <div class="item"><div class="k">實單勝率</div><div class="v" id="learn-winrate">0%</div></div>
+              <div class="item"><div class="k">實單平均損益</div><div class="v" id="learn-avg">0%</div></div>
+              <div class="item"><div class="k">目前 RR</div><div class="v" id="learn-rr">--</div></div>
+            </div>
+            <div style="margin-top:14px" class="desc"><b>新聞：</b> <span id="news-title">等待資料...</span></div>
+            <div style="margin-top:10px" class="desc"><b>預測：</b> <span id="market-prediction">--</span></div>
+          </div>
+
+          <div class="panel span-12">
+            <div class="section-head"><div><h3>候選信號快覽</h3><p>先看最重要的信號，不需要切頁就能知道目前市場節奏。</p></div><div class="seg" id="signal-filter"><button class="active" data-filter="all">全部</button><button data-filter="long">做多</button><button data-filter="short">做空</button></div></div>
+            <div class="signal-list" id="signals"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="section-signals">
+        <div class="grid">
+          <div class="panel span-12">
+            <div class="section-head"><div><h3>候選信號深度板</h3><p>依功能切換介面的感覺，保留原本自動下單判斷與 AI 放行資訊。</p></div></div>
+            <div class="signal-list" id="signals-full"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="section-positions">
+        <div class="grid">
+          <div class="panel span-12" id="fvg-section" style="display:none">
+            <div class="section-head"><div><h3>FVG 掛單追蹤</h3><p>掛單會持續重評估，失效自動取消。</p></div></div>
+            <div class="history" id="fvg-orders-body"></div>
+          </div>
+          <div class="panel span-7">
+            <div class="section-head"><div><h3>持倉監控</h3><p>保留原本全部平倉、追蹤止盈、保護單驗證資訊。</p></div><div class="toolbar"><button class="primary" onclick="runBacktest()">跑回測</button><button class="danger" onclick="closeAll()">全部平倉</button></div></div>
+            <table class="table"><thead><tr><th>幣種</th><th>方向</th><th>進場</th><th>未實現</th><th>追蹤 / 趨勢</th></tr></thead><tbody id="positions"></tbody></table>
+          </div>
+          <div class="panel span-5">
+            <div class="section-head"><div><h3>最近交易</h3><p>保留原本交易紀錄與保護單結果。</p></div></div>
+            <div class="history" id="history"></div>
+          </div>
+          <div class="panel span-12">
+            <div class="section-head"><div><h3>回測工作台</h3><p>回測仍然只做候選工具，不混進實單學習。</p></div></div>
+            <div class="kv" style="margin-bottom:14px">
+              <div class="item"><div class="k">回測市場</div><div class="v"><select id="bt-symbol-select" style="width:100%;background:transparent;border:none;color:inherit;outline:none"></select></div></div>
+              <div class="item"><div class="k">回測週期</div><div class="v"><select id="bt-tf-select" style="width:100%;background:transparent;border:none;color:inherit;outline:none"><option>5m</option><option selected>15m</option><option>1h</option><option>4h</option></select></div></div>
+              <div class="item"><div class="k">市場 / 週期</div><div class="v" id="backtest-meta">--</div></div>
+              <div class="item"><div class="k">AI 候選說明</div><div class="v" id="bt-ai-note">--</div></div>
+            </div>
+            <div class="metric-grid" style="margin-bottom:14px">
+              <div class="metric"><div class="label">交易數</div><div class="val" id="bt-trades">--</div></div>
+              <div class="metric"><div class="label">勝率</div><div class="val" id="bt-winrate">--</div></div>
+              <div class="metric"><div class="label">報酬率</div><div class="val" id="bt-net">--</div></div>
+              <div class="metric"><div class="label">最大回撤</div><div class="val" id="bt-dd">--</div></div>
+            </div>
+            <div class="progress"><div id="bt-progress" style="width:0%"></div></div>
+            <div style="margin-top:12px"><pre id="bt-summary">點上方按鈕後會呼叫 /api/backtest；回測只做候選資料；AI 僅用實單學習。</pre></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="section-ai">
+        <div class="grid">
+          <div class="panel span-12">
+            <div class="section-head"><div><h3>AI 策略 / 參數 / 前70成交量自動回測</h3><p>新增趨勢判斷相關資訊，但不更改原本功能與 API 路徑。</p></div><div class="toolbar"><button class="primary" onclick="runAiBacktest()">AI前70成交量回測</button></div></div>
+            <div class="kv">
+              <div class="item"><div class="k">AI 模式</div><div class="v" id="ai-mode-card">--</div></div>
+              <div class="item"><div class="k">AI 是否就緒</div><div class="v" id="ai-ready">--</div></div>
+              <div class="item"><div class="k">Live 實單數</div><div class="v" id="ai-live-count-card">0</div></div>
+              <div class="item"><div class="k">最近學習時間</div><div class="v" id="ai-learn">--</div></div>
+              <div class="item"><div class="k">SL 參數</div><div class="v" id="ai-sl">--</div></div>
+              <div class="item"><div class="k">TP 參數</div><div class="v" id="ai-tp">--</div></div>
+              <div class="item"><div class="k">保本觸發</div><div class="v" id="ai-be">--</div></div>
+              <div class="item"><div class="k">拖曳止盈觸發</div><div class="v" id="ai-trig">--</div></div>
+              <div class="item"><div class="k">拖曳比例</div><div class="v" id="ai-trail">--</div></div>
+              <div class="item"><div class="k">最近回測時間</div><div class="v" id="ai-bt">--</div></div>
+              <div class="item"><div class="k">掃描市場數</div><div class="v" id="ai-scan-count">--</div></div>
+              <div class="item"><div class="k">資料週期</div><div class="v" id="ai-timeframes">--</div></div>
+            </div>
+            <div style="margin-top:12px"><pre id="ai-backtest-summary">尚未啟動。</pre></div>
+          </div>
+          <div class="panel span-12">
+            <div class="section-head"><div><h3>AI 策略排行</h3><p>原本排行榜資料保留，只換成更科幻的視覺。</p></div></div>
+            <div class="history" id="ai-strategies"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const fmt = (n, d=2) => { const x = Number(n || 0); return Number.isFinite(x) ? x.toFixed(d) : '0.00'; };
+    const pctColor = (n) => Number(n) >= 0 ? 'green' : 'red';
+    const gradeClass = (g='') => g.startsWith('A') ? 'gradeA' : g.startsWith('B') ? 'gradeB' : 'gradeC';
+    let SIGNAL_CACHE = []; let ACTIVE_SIGNAL_FILTER = 'all';
+
+    function closeSidebar(){ document.body.classList.remove('sidebar-open'); }
+    function openSidebar(){ document.body.classList.add('sidebar-open'); }
+    function setActiveSection(name){
+      document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.section === name));
+      document.querySelectorAll('.section').forEach(sec => sec.classList.toggle('active', sec.id === `section-${name}`));
+      if(window.innerWidth <= 1180) closeSidebar();
+      window.scrollTo({top:0, behavior:'smooth'});
+    }
+    const mobileMenuBtn = document.getElementById('mobile-menu-btn');
+    const sidebarOverlay = document.getElementById('sidebar-overlay');
+    if(mobileMenuBtn) mobileMenuBtn.addEventListener('click', () => document.body.classList.toggle('sidebar-open'));
+    if(sidebarOverlay) sidebarOverlay.addEventListener('click', closeSidebar);
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => setActiveSection(btn.dataset.section)));
+    document.querySelectorAll('#signal-filter button').forEach(btn => btn.addEventListener('click', () => {
+      document.querySelectorAll('#signal-filter button').forEach(b => b.classList.toggle('active', b === btn));
+      ACTIVE_SIGNAL_FILTER = btn.dataset.filter || 'all';
+      renderSignalBoards(SIGNAL_CACHE);
+    }));
+
+    function filterSignals(list){
+      if(ACTIVE_SIGNAL_FILTER === 'all') return list;
+      return (list || []).filter(s => ((Number(s.score||0) >= 0) ? 'long' : 'short') === ACTIVE_SIGNAL_FILTER);
+    }
+
+    function trendBadgeClass(reason){ return reason === 'trend_continuation' ? 'good' : 'warn'; }
+    function trendModeText(mode){ return ({learning:'learning', partial:'partial', full:'full', semi:'partial'})[mode] || (mode || 'learning'); }
+
+    function renderSignalsInto(el, list){
+      if(!el) return;
+      if(!list || !list.length){ el.innerHTML = '<div class="muted">目前沒有達到門檻的信號。</div>'; return; }
+      el.innerHTML = list.map(s => {
+        const side = Number(s.score||0) >= 0 ? 'long' : 'short';
+        const scoreCls = side === 'long' ? 'green' : 'red';
+        const margin = fmt((s.margin_pct||0)*100,1) + '%';
+        const rr = fmt(s.rr_ratio||0,2);
+        const eq = fmt(s.entry_quality||0,1);
+        const dc = fmt(s.direction_confidence||0,1);
+        const grade = s.signal_grade || 'C';
+        const breakdown = s.breakdown || {};
+        const ao = s.auto_order || s.ai_decision || {};
+        const raw = (s.raw_score != null) ? fmt(s.raw_score,1) : fmt(s.score,1);
+        const trendMode = trendModeText(s.trend_mode);
+        const trendReason = s.hold_reason || 'normal_manage';
+        const trendConfidence = fmt(s.trend_confidence||0,1) + '%';
+        const breakdownHtml = Object.entries(breakdown)
+          .filter(([k,v]) => ['方向信心','進場品質','RR','Setup','等級','輔助因子','追價風險','高階位階壓力'].includes(k))
+          .slice(0,6)
+          .map(([k,v]) => `<span class="badge">${k}: ${v}</span>`).join('');
+        const orderText = ao.will_order ? '✅ AI已放行自動下單' : '⏸ AI未放行自動下單';
+        const reasonText = (ao.reasons || []).join('｜');
+        const aiMeta = ao.ai_enabled ? `AI階段 ${ao.ai_phase || '--'}｜AI樣本 ${ao.ai_sample_count ?? 0}｜AI勝率 ${fmt(ao.ai_win_rate||0,1)}%｜AI均值 ${fmt(ao.ai_avg_pnl||0,2)}%` : 'AI資料未接管';
+        return `
+          <div class="signal ${side}">
+            <div class="row">
+              <div><div class="symbol">${(s.symbol||'').replace('/USDT:USDT','')}</div><div class="muted">${s.direction || ''}</div></div>
+              <div class="score ${scoreCls}">${fmt(s.score,1)}</div>
+            </div>
+            <div class="badges">
+              <span class="badge ${gradeClass(grade)}">等級 ${grade}</span>
+              <span class="badge">型態 ${s.setup_label || '等待'}</span>
+              <span class="badge">方向信心 ${dc}</span>
+              <span class="badge">進場品質 ${eq}</span>
+              <span class="badge">RR ${rr}</span>
+              <span class="badge">保證金 ${margin}</span>
+              <span class="badge">原始分 ${raw}</span>
+            </div>
+            <div class="badges">
+              <span class="badge ${trendBadgeClass(trendReason)}">trend_mode ${trendMode}</span>
+              <span class="badge ${trendBadgeClass(trendReason)}">hold_reason ${trendReason}</span>
+              <span class="badge">趨勢信心 ${trendConfidence}</span>
+              ${s.trend_note ? `<span class="badge">${s.trend_note}</span>` : ''}
+            </div>
+            <div class="kv">
+              <div class="item"><div class="k">現價/進場</div><div class="v">${fmt(s.price,4)}</div></div>
+              <div class="item"><div class="k">止損</div><div class="v red">${fmt(s.stop_loss,4)}</div></div>
+              <div class="item"><div class="k">止盈</div><div class="v green">${fmt(s.take_profit,4)}</div></div>
+              <div class="item"><div class="k">估計報酬</div><div class="v ${scoreCls}">${fmt(s.est_pnl,2)}%</div></div>
+            </div>
+            <div class="badges">${breakdownHtml}</div>
+            <div class="badges">
+              <span class="badge">${orderText}</span>
+              <span class="badge">${aiMeta}</span>
+              ${ao.threshold != null ? `<span class="badge">門檻 ${fmt(ao.threshold,1)}</span>` : ''}
+            </div>
+            <div class="desc">${reasonText || s.desc || ''}</div>
+            ${s.score_jump ? `<div class="desc">⚠️ ${s.score_jump}</div>` : ''}
+          </div>`;
+      }).join('');
+    }
+
+    function renderSignalBoards(list){
+      const filtered = filterSignals(list || []);
+      renderSignalsInto(document.getElementById('signals'), filtered.slice(0, 6));
+      renderSignalsInto(document.getElementById('signals-full'), filtered);
+    }
+
+    function renderFvgOrders(fvgOrders){
+      const sec = document.getElementById('fvg-section');
+      const body = document.getElementById('fvg-orders-body');
+      const keys = Object.keys(fvgOrders || {});
+      if(!sec || !body) return;
+      if(!keys.length){ sec.style.display = 'none'; body.innerHTML = ''; return; }
+      sec.style.display = 'block';
+      body.innerHTML = keys.map(sym => {
+        const o = fvgOrders[sym] || {};
+        const isLong = (o.side || '') === 'long';
+        const sideCls = isLong ? 'green' : 'red';
+        const score = Number(o.curr_score ?? o.score ?? 0);
+        return `
+          <div class="hist">
+            <b>${sym.replace('/USDT:USDT','')}</b>
+            <span class="${sideCls}">${isLong ? '做多 ▲' : '做空 ▼'}</span>
+            <span>掛單 ${fmt(o.price,6)}</span>
+            <span>現價 ${o.curr_price != null ? fmt(o.curr_price,6) : '--'}</span>
+            <span class="${score >= 0 ? 'green' : 'red'}">分數 ${fmt(score,1)}</span>
+            <span>SL ${fmt(o.sl,6)}</span>
+            <span>TP ${fmt(o.tp,6)}</span>
+            <span class="muted">${o.status || '掛單中'}</span>
+            <span class="muted">${o.placed_time || '--'}</span>
+            <button class="danger" onclick="cancelFvgOrder('${sym}')">取消</button>
+          </div>`;
+      }).join('');
+    }
+
+    function renderPositions(list, trailingInfo, protectionState){
+      const el = document.getElementById('positions');
+      if(!list || !list.length){ el.innerHTML = '<tr><td colspan="5" class="muted">無持倉</td></tr>'; return; }
+      el.innerHTML = list.map(p => {
+        const pnl = Number(p.unrealizedPnl || 0);
+        const side = (p.side||'').toLowerCase() === 'long' ? '做多' : '做空';
+        const trail = trailingInfo && trailingInfo[p.symbol] ? trailingInfo[p.symbol] : null;
+        const prot = protectionState && protectionState[p.symbol] ? protectionState[p.symbol] : null;
+        const dd = Number(p.drawdown_pct ?? 0);
+        const lev = Number(p.leverage || 1);
+        const levPnl = Number(p.leveraged_pnl_pct ?? p.percentage ?? 0);
+        const trailRaw = trail ? Number(trail.trail_pct || 0) : null;
+        const trailPct = trailRaw == null ? null : (trailRaw > 1 ? trailRaw : trailRaw * 100);
+        const trailTxt = trailPct == null ? `回撤 ${fmt(dd,2)}% ｜ 槓桿 ${fmt(lev,0)}x ｜ 槓桿損益 ${levPnl >= 0 ? '+' : ''}${fmt(levPnl,2)}%` : `回撤 ${fmt(dd,2)}% ｜ 移動止盈 ${fmt(trailPct,1)}%`;
+        const protTxt = prot ? `${prot.sl_ok ? 'SL✅' : 'SL❌'} ${prot.tp_ok ? 'TP✅' : 'TP❌'}` : '待驗證';
+        const trendMode = trendModeText(p.trend_mode);
+        const holdReason = p.hold_reason || 'normal_manage';
+        return `<tr>
+          <td>${(p.symbol||'').replace('/USDT:USDT','')}</td>
+          <td class="${pnl >= 0 ? 'green' : 'red'}">${side}</td>
+          <td>${fmt(p.entryPrice,4)}</td>
+          <td class="${pnl >= 0 ? 'green' : 'red'}">${pnl >= 0 ? '+' : ''}${fmt(pnl,4)}</td>
+          <td>${trailTxt}<br><span class="muted">${protTxt}</span><br><span class="muted">trend_mode ${trendMode}｜hold_reason ${holdReason}｜信心 ${fmt(p.trend_confidence||0,1)}%</span></td>
+        </tr>`;
+      }).join('');
+    }
+
+    function renderHistory(list){
+      const el = document.getElementById('history');
+      if(!list || !list.length){ el.innerHTML = '<div class="muted">尚無紀錄</div>'; return; }
+      el.innerHTML = list.slice(0,12).map(h => `
+        <div class="hist">
+          <span class="muted">${h.time || '--'}</span>
+          <b>${(h.symbol||'').replace('/USDT:USDT','')}</b>
+          <span class="${h.side === '做多' ? 'green' : 'red'}">${h.side || '--'}</span>
+          <span>@ ${fmt(h.price,4)}</span>
+          <span class="yellow">${fmt(h.score,1)} 分</span>
+          <span>SL ${fmt(h.stop_loss,4)}</span>
+          <span>TP ${fmt(h.take_profit,4)}</span>
+          ${h.order_usdt ? `<span class="blue">${fmt(h.order_usdt,2)}U</span>` : ''}
+          ${h.pnl_pct != null ? `<span class="${Number(h.pnl_pct)>=0?'green':'red'}">${Number(h.pnl_pct)>=0?'+':''}${fmt(h.pnl_pct,2)}%</span>` : ''}
+          ${h.protection_ok != null ? `<span class="${h.protection_ok ? 'green' : 'red'}">${h.protection_ok ? '保護單已驗證' : '保護單未完整'}</span>` : ''}
+        </div>`).join('');
+    }
+
+    function renderAiStrategies(list){
+      const el = document.getElementById('ai-strategies');
+      if(!el) return;
+      if(!list || !list.length){ el.innerHTML = '<div class="muted">尚無 AI 排行。</div>'; return; }
+      el.innerHTML = list.map(s => `
+        <div class="hist">
+          <b>${s.strategy || '--'}</b>
+          <span>樣本 ${s.count ?? '--'}</span>
+          <span class="${Number(s.win_rate||0) >= 50 ? 'green':'red'}">勝率 ${fmt(s.win_rate||0,1)}%</span>
+          <span class="${Number(s.avg_pnl||0) >= 0 ? 'green':'red'}">平均 ${fmt(s.avg_pnl||0,2)}%</span>
+          <span>分數 ${fmt(s.score||0,2)}</span>
+          ${s.confidence != null ? `<span>信心 ${fmt(((Number(s.confidence)||0) <= 1 ? Number(s.confidence)*100 : Number(s.confidence)),0)}%</span>` : ''}
+          ${s.ev_per_trade != null ? `<span>EV/筆 ${fmt(s.ev_per_trade,4)}</span>` : ''}
+          ${s.profit_factor != null ? `<span>PF ${fmt(s.profit_factor,2)}</span>` : ''}
+          ${s.max_drawdown_pct != null ? `<span>DD ${fmt(s.max_drawdown_pct,2)}%</span>` : ''}
+          ${s.strategy_mode ? `<span>模式 ${s.strategy_mode}</span>` : ''}
+          ${s.timeframes ? `<span>週期 ${s.timeframes}</span>` : ''}
+          ${s.updated_at ? `<span class="muted">${s.updated_at}</span>` : ''}
+        </div>`).join('');
+    }
+
+    async function runAiBacktest(){
+      document.getElementById('ai-backtest-summary').textContent = 'AI前70成交量回測中...';
+      try{
+        const res = await fetch('/api/force_backtest', {method:'POST'});
+        const d = await res.json();
+        if(!d.ok){ document.getElementById('ai-backtest-summary').textContent = d.error || '回測失敗'; return; }
+        document.getElementById('ai-backtest-summary').textContent = d.summary || '完成';
+        setTimeout(refresh, 800);
+      }catch(err){ document.getElementById('ai-backtest-summary').textContent = '回測失敗: ' + err; }
+    }
+
+    function aiLooksEmpty(d){
+      const ai = (d && d.ai_panel) || {}; const ab = (d && d.auto_backtest) || {};
+      const hasPanel = !!(ai.regime || ai.last_backtest || ai.last_learning || (ai.best_strategies||[]).length || (ai.params && Object.keys(ai.params).length));
+      const hasBt = !!(ab.summary || ab.last_run || (ab.results||[]).length || ab.scanned_markets || ab.db_symbols);
+      return !(hasPanel || hasBt);
+    }
+
+    async function fetchMergedState(){
+      const base = await fetch('/api/state').then(r => r.json());
+      if(!aiLooksEmpty(base)) return base;
+      try{
+        const extra = await fetch('/api/ai_status').then(r => r.json());
+        return Object.assign({}, base, { ai_panel: extra.ai_panel || base.ai_panel || {}, auto_backtest: extra.auto_backtest || base.auto_backtest || {}, ai_runtime: extra || {} });
+      }catch(err){ return base; }
+    }
+
+    async function fetchAiDbStatsSafe(){ try{ const res = await fetch('/api/ai_db_stats'); if(!res.ok) return null; return await res.json(); }catch(e){ return null; } }
+
+    function setText(id, value, cls){ const el = document.getElementById(id); if(!el) return; el.textContent = value; if(cls) el.className = cls; }
+    function updateTrendWidgets(trend){
+      const mode = trendModeText(trend.trend_mode || 'learning');
+      const holdReason = trend.hold_reason || 'normal_manage';
+      const conf = Number(trend.trend_confidence || 0);
+      setText('trend-mode', mode); setText('hold-reason', holdReason); setText('trend-sample-count', trend.trend_learning_count ?? 0);
+      setText('trend-cont-rate', fmt(trend.trend_continuation_rate || 0, 1) + '%'); setText('trend-run-avg', fmt(trend.trend_avg_run_pct || 0, 2) + '%'); setText('trend-pullback-avg', fmt(trend.trend_avg_pullback_pct || 0, 2) + '%');
+      setText('trend-note', trend.trend_note || '等待資料...'); setText('trend-confidence-big', fmt(conf, 0) + '%');
+      setText('sidebar-trend-mode', mode); setText('sidebar-hold-reason', holdReason); setText('sidebar-trend-confidence', fmt(conf,1) + '%'); setText('trend-mode-pill', mode);
+      const ring = document.getElementById('trend-ring'); if(ring) ring.style.setProperty('--ring', `${Math.max(8, Math.min(360, conf * 3.6))}deg`);
+    }
+
+    async function refresh(){
+      try{
+        const [d, aiDb] = await Promise.all([fetchMergedState(), fetchAiDbStatsSafe()]);
+        SIGNAL_CACHE = d.top_signals || [];
+        setText('last-update', d.last_update || '--'); setText('scan-progress', d.scan_progress || '--');
+        setText('equity', fmt(d.equity,2));
+        const pnlEl = document.getElementById('total-pnl'); if(pnlEl){ pnlEl.textContent = (Number(d.total_pnl||0)>=0?'+':'') + fmt(d.total_pnl,2); pnlEl.className = `val ${pctColor(d.total_pnl)}`; }
+        const th = d.threshold_info || {}; setText('threshold', th.current || 50); setText('threshold-phase', th.phase || '預設');
+        const rs = d.risk_status || {}; const riskText = rs.trading_ok === false ? '已限制' : '正常'; setText('risk-flag', riskText, `val ${rs.trading_ok === false ? 'red' : 'green'}`); setText('risk-flag-side', riskText); setText('risk-note', rs.halt_reason || `連損 ${rs.consecutive_loss||0}｜日損 ${fmt(rs.daily_loss_pct||0,1)}%`);
+
+        const m = d.market_info || {}; setText('market-direction', m.direction || '--'); setText('market-pattern', m.pattern || '--'); setText('market-prediction', m.prediction || '--');
+        setText('news-title', d.latest_news_title || '等待資料...'); setText('news-sentiment', d.news_sentiment || '--'); setText('news-score', d.news_score || 0);
+
+        const ls = d.learn_summary || {}; const liveTotal = (aiDb && (aiDb.total_live ?? aiDb.live_trades ?? aiDb.closed_live_count)) ?? ls.total_trades ?? 0;
+        setText('learn-total', liveTotal); setText('learn-winrate', fmt(ls.win_rate || 0,1) + '%');
+        const realizedAvg = Number(ls.avg_pnl||0); const learnAvg = document.getElementById('learn-avg'); if(learnAvg){ learnAvg.textContent = `${realizedAvg>=0?'+':''}${fmt(realizedAvg,2)}%`; learnAvg.className = `v ${pctColor(realizedAvg)}`; }
+        const rr = (Number(ls.current_tp_mult||0) / Math.max(Number(ls.current_sl_mult||1), 0.0001)); setText('learn-rr', fmt(rr,2));
+
+        const ai = d.ai_panel || {}; const ap = ai.params || {}; const ab = d.auto_backtest || {};
+        const mode = (aiDb && (aiDb.mode || aiDb.ai_phase || aiDb.ai_mode)) || (liveTotal < 20 ? 'learning' : (liveTotal < 50 ? 'semi' : 'full'));
+        const ready = (aiDb && (aiDb.ai_ready != null ? aiDb.ai_ready : aiDb.ready)) ?? (liveTotal >= 50);
+        const modeText = (mode==='learning'?'探索學習':(mode==='semi'?'半接管':'完整接管'));
+        setText('ai-mode', modeText); setText('ai-mode-card', modeText); setText('ai-ready', ready ? '是' : '否'); setText('ai-live-count', liveTotal); setText('ai-live-count-card', liveTotal);
+        setText('ai-sl', ap.sl_mult ?? '--'); setText('ai-tp', ap.tp_mult ?? '--'); setText('ai-be', ap.breakeven_atr ?? '--'); setText('ai-trig', ap.trail_trigger_atr ?? '--'); setText('ai-trail', ap.trail_pct ?? '--');
+        setText('ai-learn', ai.last_learning || (aiDb && aiDb.last_learning) || '--'); setText('ai-bt', ai.last_backtest || '--'); setText('ai-scan-count', `${ab.scanned_markets ?? 0}/${ab.target_count ?? 70}`);
+        setText('ai-timeframes', Array.isArray(ab.data_timeframes) ? ab.data_timeframes.join(' / ') : ((ai.market_db_info && Array.isArray(ai.market_db_info.timeframes)) ? ai.market_db_info.timeframes.join(' / ') : '--'));
+        const elSum = document.getElementById('ai-backtest-summary'); if(elSum){ const errCount = Array.isArray(ab.errors) ? ab.errors.length : 0; const extra = ab.last_duration_sec ? `｜耗時 ${fmt(ab.last_duration_sec,1)}s` : ''; const sourceNote = '｜回測只做候選，AI只吃實單'; const fallbackSummary = ab.running ? 'AI回測進行中' : ((ai.last_backtest && ai.last_backtest !== '--') ? `AI已完成上一輪回測 ${ai.last_backtest}` : 'AI引擎待命'); elSum.textContent = (ab.summary || fallbackSummary) + (errCount ? `｜錯誤 ${errCount}` : '') + extra + sourceNote; }
+        const btAi = document.getElementById('bt-ai-note'); if(btAi) btAi.textContent = ab.results && ab.results.length ? `AI目前最佳候選：${ab.results[0].symbol}｜樣本 ${ab.results[0].trades ?? '--'}｜勝率 ${fmt(ab.results[0].win_rate||0,1)}%｜EV/筆 ${fmt(ab.results[0].ev_per_trade||0,4)}｜僅候選，不直接接管` : 'AI尚未建立最佳市場候選';
+
+        updateTrendWidgets(d.trend_dashboard || {});
+        renderAiStrategies(ai.best_strategies || []); updateBacktestSelectors(d); renderSignalBoards(SIGNAL_CACHE); renderFvgOrders(d.fvg_orders || {}); renderPositions(d.active_positions || [], d.trailing_info || {}, d.protection_state || {}); renderHistory(d.trade_history || []);
+      }catch(err){ setText('scan-progress', '讀取失敗：' + err); }
+    }
+
+    async function cancelFvgOrder(symbol){ if(!confirm(`確定取消 ${symbol} 的 FVG 掛單？`)) return; try{ await fetch('/api/cancel_fvg_order', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({symbol}) }); }catch(err){} setTimeout(refresh, 800); }
+    async function releaseRiskOverride(){ try{ const res = await fetch('/api/risk_override', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'release'})}); const d = await res.json(); alert(d.message || (d.ok ? '已解除風控暫停' : '解除失敗')); setTimeout(refresh, 800);}catch(e){ alert('解除風控失敗: ' + e.message); } }
+    async function closeAll(){ if(!confirm('確定全部平倉？')) return; await fetch('/api/close_all', {method:'POST'}); setTimeout(refresh, 1000); }
+
+    function updateBacktestSelectors(data){
+      const sel = document.getElementById('bt-symbol-select'); if(!sel) return; const current = sel.value || 'auto'; const options = []; options.push({value:'auto', label:'AI自動選擇最佳市場'}); const seen = new Set(['auto']); const rows = ((data.auto_backtest||{}).results || []).concat(data.top_signals || []);
+      rows.forEach(r => { const sym = r.symbol; if(!sym || seen.has(sym)) return; seen.add(sym); const extra = r.market_regime ? `｜${r.market_regime}` : ''; options.push({value:sym, label:`${sym}${extra}`}); });
+      sel.innerHTML = options.map(o => `<option value="${o.value}">${o.label}</option>`).join(''); sel.value = seen.has(current) ? current : 'auto';
+    }
+
+    async function runBacktest(){
+      document.getElementById('bt-summary').textContent = '回測執行中...'; document.getElementById('bt-progress').style.width = '35%';
+      const symbol = document.getElementById('bt-symbol-select')?.value || 'auto'; const timeframe = document.getElementById('bt-tf-select')?.value || '15m';
+      try{
+        const res = await fetch(`/api/backtest?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=1000`); const d = await res.json(); document.getElementById('bt-progress').style.width = '100%';
+        if(!d.ok){ document.getElementById('bt-summary').textContent = d.error || '回測失敗'; return; }
+        setText('backtest-meta', `${d.symbol || d.selected_symbol || 'AUTO'}｜${d.timeframe || timeframe}`); setText('bt-trades', d.trades ?? d.total_trades ?? '--'); setText('bt-winrate', fmt(d.win_rate ?? 0,2) + '%');
+        const retPct = (d.return_pct != null) ? d.return_pct : (d.net_profit_pct != null ? d.net_profit_pct : 0); setText('bt-net', (Number(retPct||0)>=0?'+':'') + fmt(retPct||0,2) + '%'); setText('bt-dd', fmt(d.max_drawdown_pct ?? 0,2) + '%');
+        const lastTrades = Array.isArray(d.last_10_trades) ? d.last_10_trades.slice(-8) : []; const lines = [`市場: ${d.symbol || d.selected_symbol || symbol}`, `週期: ${d.timeframe || timeframe}`, `交易數: ${d.trades ?? '--'}`, `勝率: ${fmt(d.win_rate ?? 0,2)}%`, `報酬: ${fmt(retPct || 0,2)}%`, `最大回撤: ${fmt(d.max_drawdown_pct ?? 0,2)}%`, '', '最近交易:'];
+        lastTrades.forEach(t => lines.push(`${t.side || '--'} | entry ${fmt(t.entry,4)} -> exit ${fmt(t.exit,4)} | pnl ${fmt(t.pnl,4)} | ${t.reason || '--'}`)); document.getElementById('bt-summary').textContent = lines.join('\n');
+      }catch(err){ document.getElementById('bt-summary').textContent = '回測失敗: ' + err; document.getElementById('bt-progress').style.width = '0%'; }
+    }
+
+    refresh(); setInterval(refresh, 8000);
+  </script>
+</body>
+</html>
