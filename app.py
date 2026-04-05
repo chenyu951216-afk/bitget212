@@ -7046,26 +7046,27 @@ def _direction_profile_v6(d15, d4h, d1d):
 
 
 def _grade_signal_v6(direction_conf, setup_q, rr, anti_chase_penalty, htf_penalty):
-    """統一等級判定，偏向反映可交易性而非過度保守，避免整排被壓成 C。"""
+    """統一等級判定：更貼近實際可交易性，避免被懲罰項過度壓成整排 C。"""
     dc = max(0.0, min(float(direction_conf or 0.0), 10.0))
     sq = max(0.0, min(float(setup_q or 0.0), 10.0))
-    rrv = max(0.0, min(float(rr or 0.0), 3.0))
+    rrv = max(0.0, min(float(rr or 0.0), 3.2))
     anti = max(0.0, float(anti_chase_penalty or 0.0))
     htf = max(0.0, float(htf_penalty or 0.0))
 
-    tradability = sq * 6.0 + min(rrv, 2.6) * 5.1 + dc * 4.1
-    penalty = anti * 0.28 + htf * 0.22
+    rr_bonus = max(min((rrv - 1.1) * 5.6, 8.5), -2.5)
+    tradability = sq * 7.4 + dc * 4.9 + rr_bonus
+    penalty = anti * 0.22 + htf * 0.18
     composite = tradability - penalty
 
-    if sq >= 7.2 and rrv >= 2.2 and dc >= 4.8 and composite >= 60:
+    if sq >= 7.0 and rrv >= 2.0 and dc >= 4.6 and composite >= 66:
         return 'A+'
-    if sq >= 6.2 and rrv >= 1.9 and dc >= 3.8 and composite >= 52:
+    if sq >= 5.9 and rrv >= 1.7 and dc >= 3.5 and composite >= 55:
         return 'A'
-    if sq >= 5.2 and rrv >= 1.55 and dc >= 2.4 and composite >= 43:
+    if sq >= 4.8 and rrv >= 1.45 and dc >= 2.6 and composite >= 45:
         return 'B+'
-    if sq >= 4.1 and rrv >= 1.3 and composite >= 34:
+    if sq >= 3.6 and rrv >= 1.2 and composite >= 35:
         return 'B'
-    if sq >= 2.6 and rrv >= 1.1 and composite >= 25:
+    if sq >= 2.2 and rrv >= 1.0 and composite >= 24:
         return 'C'
     return 'D'
 
@@ -7101,14 +7102,14 @@ def analyze_legacy_shadow_2(symbol):
 
         setup = _best_setup_v6(d15, side)
         if not setup:
-            # 沒有明確觸發，維持觀察，不讓純方向分數硬進場
-            base = 18 + direction_conf_view * 3.6
-            capped = min(base, 34)
-            wait_quality = round(max(1.2, min(5.2, direction_conf_view * 0.38 + max(adx15 - 16.0, 0.0) * 0.06)), 2)
-            wait_trend_conf = round(max(0.0, min(direction_conf_view * 9.2 + max(adx4 - 15.0, 0.0) * 1.2, 99.0)), 1)
-            wait_regime_conf = round(max(0.0, min(direction_conf_view * 8.0 + max(adx15 - 14.0, 0.0) * 1.0, 99.0)), 1)
-            wait_grade = _grade_signal_v6(max(direction_conf_view, wait_trend_conf / 10.0), wait_quality, 1.0, 0, 0)
-            wait_direction = round(max(direction_conf_view, wait_trend_conf / 10.0, wait_regime_conf / 11.5), 1)
+            # 沒有明確觸發，維持觀察，但讓等待中的品質/信心更貼近真實可交易性
+            base = 22 + direction_conf_view * 4.0 + max(adx15 - 18.0, 0.0) * 0.35
+            capped = min(base, 42)
+            wait_quality = round(max(2.0, min(6.4, direction_conf_view * 0.46 + max(adx15 - 16.0, 0.0) * 0.08 + max(adx4 - 16.0, 0.0) * 0.05)), 2)
+            wait_trend_conf = round(max(0.0, min(direction_conf_view * 9.8 + max(adx4 - 15.0, 0.0) * 1.35, 99.0)), 1)
+            wait_regime_conf = round(max(0.0, min(direction_conf_view * 8.6 + max(adx15 - 14.0, 0.0) * 1.15, 99.0)), 1)
+            wait_direction = round(max(direction_conf_view * 0.65 + wait_trend_conf / 22.0 + wait_regime_conf / 26.0, wait_trend_conf / 11.0, wait_regime_conf / 12.0), 1)
+            wait_grade = _grade_signal_v6(wait_direction, wait_quality, 1.15, 0, 0)
             return side * capped, '方向有但未到觸發位|等待回踩/突破確認', curr, 0, 0, 0, {
                 '方向信心': wait_direction, 'Setup':'等待觸發', '進場品質': wait_quality, 'RR':0, '等級':wait_grade,
                 'TrendConfidence': wait_trend_conf,
@@ -7206,12 +7207,17 @@ def analyze_legacy_shadow_2(symbol):
         except Exception:
             pass
 
-        raw = direction_conf_view * 8.8 + setup_q * 5.6 + helper - anti_chase_penalty * 0.9 - htf_penalty * 0.8
-        if not direction_strong:
-            raw *= 0.94
-        score_abs = _clip(raw, 12, 92)
-        if score_abs < 44:
-            score_abs *= 0.84
+        rr_bonus = max(min((rr_ratio - 1.2) * 6.2, 8.0), -3.5)
+        momentum_bonus = max(min(helper * 1.05, 9.0), -7.0)
+        penalty_soft = anti_chase_penalty * 0.52 + htf_penalty * 0.44
+        raw = direction_conf_view * 7.4 + setup_q * 7.1 + rr_bonus + momentum_bonus - penalty_soft
+        if direction_strong:
+            raw += 2.2
+        else:
+            raw -= 1.2
+        score_abs = _clip(raw, 18, 94)
+        if score_abs < 46:
+            score_abs = 46 - (46 - score_abs) * 0.55
         score = round(score_abs if side > 0 else -score_abs, 1)
 
         sl_mult = round(abs(entry - sl) / max(atr15, 1e-9), 2)
@@ -7222,11 +7228,10 @@ def analyze_legacy_shadow_2(symbol):
         breakdown['進場品質'] = round(setup_q, 1)
         breakdown['RR'] = round(rr_ratio, 2)
         breakdown['Setup'] = setup_label
-        trend_conf_val = round(max(0.0, min(direction_conf_view * 9.0 + setup_q * 4.2 - anti_chase_penalty * 0.85 - htf_penalty * 0.6, 99.0)), 1)
-        regime_conf_val = round(max(0.0, min(direction_conf_view * 7.8 + max(helper, -6) * 1.05 - htf_penalty * 0.45, 99.0)), 1)
-        if direction_conf_view <= 0.2:
-            direction_conf_view = max(direction_conf_view, trend_conf_val / 10.5, regime_conf_val / 11.5)
-        breakdown['方向信心'] = round(max(direction_conf_view, 0.0), 1)
+        trend_conf_val = round(max(0.0, min(direction_conf_view * 8.6 + setup_q * 5.4 + rr_bonus * 2.2 - anti_chase_penalty * 0.62 - htf_penalty * 0.55, 99.0)), 1)
+        regime_conf_val = round(max(0.0, min(direction_conf_view * 7.2 + max(helper, -6) * 1.35 + rr_bonus * 1.6 - htf_penalty * 0.4, 99.0)), 1)
+        direction_display = max(direction_conf_view * 0.58 + trend_conf_val / 20.0 + regime_conf_val / 24.0, trend_conf_val / 11.0, regime_conf_val / 12.5)
+        breakdown['方向信心'] = round(max(direction_display, 0.0), 1)
         breakdown['TrendConfidence'] = trend_conf_val
         breakdown['RegimeConfidence'] = regime_conf_val
         breakdown['RegimeBias'] = side * round(direction_conf_view, 2)
