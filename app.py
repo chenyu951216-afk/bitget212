@@ -85,6 +85,7 @@ RISK_STATE_PATH         = "/app/data/risk_state.json"
 
 SCORE_SMOOTH_ALPHA  = EXECUTION_POLICY['score_smooth_alpha']      # 穩定分數權重（越高越跟即時）
 ENTRY_LOCK_SEC      = EXECUTION_POLICY['entry_lock_sec']       # 同一幣種 5 分鐘內不重複開新單
+POST_CLOSE_COOLDOWN_SEC = 30 * 60                              # 同一個幣平倉後 30 分鐘內不重下
 MIN_RR_HARD_FLOOR   = DECISION_POLICY['min_rr_hard_floor']      # 自動下單最低 RR
 TREND_AI_SEMI_TRADES = DATASET_POLICY['trend_ai_semi_trades']       # 趨勢學習 30 筆後半介入
 TREND_AI_FULL_TRADES = DATASET_POLICY['trend_ai_full_trades']       # 趨勢學習 50 筆後全介入
@@ -105,6 +106,7 @@ DECISION_PRIORITY_ORDER = list(DECISION_POLICY['decision_priority_order'])
 SIGNAL_META_CACHE   = {}        # 最近一次分析快取（給追蹤/驗證用）
 SCORE_CACHE         = {}        # 分數平滑快取
 ENTRY_LOCKS         = {}        # 進場鎖，避免 90→30 反覆觸發
+POST_CLOSE_LOCKS    = {}        # 平倉冷卻鎖，同幣平倉後 30 分鐘內不重下
 PROTECTION_STATE    = {}        # 交易所保護單驗證狀態
 AUTO_ORDER_AUDIT    = {}        # 記錄每輪為何沒下單
 API_ERROR_STREAK    = 0
@@ -2382,14 +2384,36 @@ def score_jump_alert(symbol, raw_score, stable_score):
         return '分數快變 {:.1f}'.format(delta)
     return ''
 
-def can_reenter_symbol(symbol):
+def _cooldown_remaining_seconds(symbol):
+    now_ts = time.time()
     with CACHE_LOCK:
-        ts = ENTRY_LOCKS.get(symbol, 0)
-    return (time.time() - ts) >= ENTRY_LOCK_SEC
+        entry_ts = float(ENTRY_LOCKS.get(symbol, 0) or 0)
+        close_ts = float(POST_CLOSE_LOCKS.get(symbol, 0) or 0)
+    remain_entry = max(0.0, ENTRY_LOCK_SEC - (now_ts - entry_ts))
+    remain_close = max(0.0, POST_CLOSE_COOLDOWN_SEC - (now_ts - close_ts))
+    return max(remain_entry, remain_close)
+
+def can_reenter_symbol(symbol):
+    return _cooldown_remaining_seconds(symbol) <= 0
+
+def get_symbol_cooldown_note(symbol):
+    remain = _cooldown_remaining_seconds(symbol)
+    if remain <= 0:
+        return ''
+    mins = int(math.ceil(remain / 60.0))
+    with CACHE_LOCK:
+        close_ts = float(POST_CLOSE_LOCKS.get(symbol, 0) or 0)
+    if close_ts > 0 and (time.time() - close_ts) < POST_CLOSE_COOLDOWN_SEC:
+        return '同幣平倉冷卻中 {} 分鐘'.format(mins)
+    return '同幣進場冷卻中 {} 分鐘'.format(mins)
 
 def touch_entry_lock(symbol):
     with CACHE_LOCK:
         ENTRY_LOCKS[symbol] = time.time()
+
+def touch_post_close_lock(symbol):
+    with CACHE_LOCK:
+        POST_CLOSE_LOCKS[symbol] = time.time()
 
 def fetch_real_atr(symbol, timeframe='15m', limit=60):
     try:
@@ -2668,8 +2692,9 @@ def queue_learn_for_closed_symbol(sym, active_syms=None):
                     break
             save_learn_db(LEARN_DB)
             PENDING_LEARN_IDS.add(trade_id)
+        touch_post_close_lock(sym)
 
-        print('偵測到平倉: {}，開始學習分析... exit_price={} source={}'.format(sym, exit_price, fill.get('info') or 'ticker'))
+        print('偵測到平倉: {}，開始學習分析... exit_price={} source={} | 啟用30分鐘冷卻'.format(sym, exit_price, fill.get('info') or 'ticker'))
         _enqueue_closed_trade_learning(trade_id)
         return True
     except Exception as e:
@@ -3311,7 +3336,7 @@ def build_auto_order_reason(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, p
     if same_dir_cnt >= MAX_SAME_DIRECTION:
         reasons.append('同向持倉已滿')
     if not can_reenter_symbol(sig['symbol']):
-        reasons.append('進場冷卻中')
+        reasons.append(get_symbol_cooldown_note(sig['symbol']) or '進場冷卻中')
     if AI_FULL_SCORE_CONTROL:
         reasons.append('舊RR/進場品質/型態公式已轉為AI輔助特徵')
     if ai_decision:
@@ -5238,10 +5263,11 @@ def close_position(sym, contracts, side):
         close_side = 'sell' if side == 'long' else 'buy'
         exchange.create_order(sym, 'market', close_side, abs(contracts),
                               params={'reduceOnly': True})
+        touch_post_close_lock(sym)
         with TRAILING_LOCK:
             if sym in TRAILING_STATE:
                 del TRAILING_STATE[sym]
-        print("移動止盈平倉成功: {} {}口".format(sym, contracts))
+        print("移動止盈平倉成功: {} {}口 | 啟用30分鐘冷卻".format(sym, contracts))
         return True
     except Exception as e:
         print("移動止盈平倉失敗 {}: {}".format(sym, e))
@@ -6133,7 +6159,7 @@ def place_order(sig):
     # 防重複：本輪已下單的幣不再重複
     sym_check = sig['symbol']
     if not can_reenter_symbol(sym_check):
-        print('⚠️ 進場冷卻中，跳過 {}'.format(sym_check))
+        print('⚠️ {}，跳過 {}'.format(get_symbol_cooldown_note(sym_check) or '進場冷卻中', sym_check))
         return
     with _ORDERED_LOCK:
         if sym_check in _ORDERED_THIS_SCAN:
@@ -6580,7 +6606,8 @@ def scan_thread():
                         def _do_reverse_close(s, c, cs, score, mprice):
                             try:
                                 exchange.create_order(s,'market',cs,abs(c),params={'reduceOnly':True})
-                                print("反向平倉成功: {} 新分數:{:.1f}".format(s, score))
+                                touch_post_close_lock(s)
+                                print("反向平倉成功: {} 新分數:{:.1f} | 啟用30分鐘冷卻".format(s, score))
                                 reverse_rec = {
                                         "symbol":s,"side":"反向平倉","score":score,
                                         "price":mprice,"stop_loss":0,"take_profit":0,
@@ -9280,12 +9307,12 @@ def memory_guard_thread():
                     if ts and now_ts - ts > 900:
                         SIGNAL_META_CACHE.pop(sym, None)
                         SCORE_CACHE.pop(sym, None)
-                for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS]:
+                for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS, POST_CLOSE_LOCKS]:
                     prune_mapping(cache, max_size=500, prune_count=200)
             with PROTECTION_LOCK:
                 prune_mapping(PROTECTION_STATE, max_size=500, prune_count=200)
             with AI_LOCK:
-                AI_PANEL['memory'] = {'score_cache': len(SCORE_CACHE),'signal_meta_cache': len(SIGNAL_META_CACHE),'entry_locks': len(ENTRY_LOCKS),'protection_state': len(PROTECTION_STATE),'fvg_orders': len(FVG_ORDERS)}
+                AI_PANEL['memory'] = {'score_cache': len(SCORE_CACHE),'signal_meta_cache': len(SIGNAL_META_CACHE),'entry_locks': len(ENTRY_LOCKS),'post_close_locks': len(POST_CLOSE_LOCKS),'protection_state': len(PROTECTION_STATE),'fvg_orders': len(FVG_ORDERS)}
             gc.collect()
             update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE))
         except Exception as e:
