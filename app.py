@@ -1,4 +1,4 @@
-import os, sys, ccxt, threading, time, requests, gc, json, math
+import os, sys, ccxt, threading, time, gc, json, math
 import numpy as np
 sys.stdout.reconfigure(line_buffering=True)  # 即時 flush logs
 import pandas as pd
@@ -10,20 +10,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from bot_runtime_utils import atomic_json_load, atomic_json_save, prune_mapping, safe_request_json, safe_request_text, snapshot_mapping
+from bot_runtime_utils import atomic_json_load, atomic_json_save, prune_mapping, snapshot_mapping
 from bot_market_guard import MarketDirectionGuard
 from bot_storage import BotStorage
 import bot_news_disabled
-from ai_dataset_guard import build_learning_weights as ext_build_learning_weights, learning_weight_summary as ext_learning_weight_summary
+from ai_dataset_guard import learning_weight_summary as ext_learning_weight_summary
 from ai_observer_tools import trigger_hit_leaderboard, neutral_failure_stats
 from ai_execution_guard import exchange_quality_snapshot as exec_quality_snapshot, execution_gate, protection_failure_action
 from ai_replay_store import save_decision_input_snapshot, load_decision_input_snapshots, ensure_replay_tables
 from ai_market_context import build_market_consensus
-from ai_session_tools import session_bucket_from_hour, build_session_bias as build_ext_session_bias
+from ai_session_tools import session_bucket_from_hour
 from ai_risk_alerts import derive_auto_mode
 from ai_decision_intelligence import apply_decision_inertia, detect_market_tempo, classify_exit_type, weighted_trade_stats, recent_setup_loss_streak, confidence_position_multiplier, apply_exit_learning_to_params
 from learning_engine import enrich_learning_trade, filter_learning_pool, phase_from_counts, build_decision_fingerprint, execution_quality_bucket
-from routes_ai import build_ai_db_stats_payload, build_ai_learning_recent_payload, build_ai_debug_payload, build_ai_learning_health_payload, build_ai_strategy_matrix_payload, build_ai_decision_explain_payload, build_learning_sample_review_payload
+from routes_ai import build_ai_learning_recent_payload, build_ai_debug_payload, build_ai_learning_health_payload, build_ai_strategy_matrix_payload, build_ai_decision_explain_payload, build_learning_sample_review_payload
 from state_service import env_or_blank, build_learning_dataset_meta, DEFAULT_RUNTIME_STATE
 from decision_calibrator import calibrate_trade_decision
 from execution_engine import execution_score_from_snapshot
@@ -54,11 +54,11 @@ exchange.enableRateLimit = True
 PANIC_API_KEY   = env_or_blank('PANIC_API_KEY')
 OPENAI_API_KEY  = env_or_blank('OPENAI_API_KEY')
 ANTHROPIC_KEY   = env_or_blank('ANTHROPIC_API_KEY')
-ORDER_THRESHOLD         = DECISION_POLICY['order_threshold']   # 預設門檻 60
-ORDER_THRESHOLD_DEFAULT = DECISION_POLICY['order_threshold_default']   # 預設值
-ORDER_THRESHOLD_HIGH    = DECISION_POLICY['order_threshold_high']   # 持續滿倉後提高到 80
-ORDER_THRESHOLD_DROP    = DECISION_POLICY['order_threshold_drop']    # 每空一輪下降 2 分
-ORDER_THRESHOLD_FLOOR   = DECISION_POLICY['order_threshold_floor']   # 最低只降到 55
+ORDER_THRESHOLD         = min(float(DECISION_POLICY['order_threshold'] or 60), 48.0)   # AI主控版：初始門檻先放寬給 AI 探索
+ORDER_THRESHOLD_DEFAULT = min(float(DECISION_POLICY['order_threshold_default'] or 60), 48.0)   # AI主控版預設值
+ORDER_THRESHOLD_HIGH    = min(float(DECISION_POLICY['order_threshold_high'] or 80), 62.0)   # AI主控版上限
+ORDER_THRESHOLD_DROP    = max(float(DECISION_POLICY['order_threshold_drop'] or 2), 1.5)    # AI主控版空窗時更快放寬
+ORDER_THRESHOLD_FLOOR   = min(float(DECISION_POLICY['order_threshold_floor'] or 55), 44.0)   # AI主控版最低探索門檻
 
 # =====================================================
 # 核心交易參數
@@ -71,7 +71,7 @@ MAX_OPEN_POSITIONS    = RISK_POLICY['max_open_positions']         # 短線總持
 MAX_SAME_DIRECTION    = RISK_POLICY['max_same_direction']         # 同方向最多 5 筆
 TIME_STOP_BARS_15M    = RISK_POLICY['time_stop_bars_15m']        # 15 根 15m K 仍不走就時間止損
 NEWS_CACHE_TTL_SEC    = EXECUTION_POLICY['news_cache_ttl_sec']       # 新聞快取 5 分鐘
-ANTI_CHASE_ATR      = EXECUTION_POLICY['anti_chase_atr']      # 價格偏離 15m EMA20 超過 1.25ATR 視為追價風險
+ANTI_CHASE_ATR      = max(float(EXECUTION_POLICY['anti_chase_atr'] or 1.25), 1.75)      # AI主控版：放寬追價判定，改以扣分為主
 BREAKOUT_LOOKBACK   = EXECUTION_POLICY['breakout_lookback']        # 預判暴拉/暴跌的區間觀察根數
 PULLBACK_BUFFER_ATR = EXECUTION_POLICY['pullback_buffer_atr']      # 避免追價，優先等 0.35ATR 回踩/反彈
 SCALE_IN_MIN_RATIO = EXECUTION_POLICY['scale_in_min_ratio']      # 分批進場第二批最低比例
@@ -88,13 +88,13 @@ ENTRY_LOCK_SEC      = EXECUTION_POLICY['entry_lock_sec']       # 同一幣種 5 
 MIN_RR_HARD_FLOOR   = DECISION_POLICY['min_rr_hard_floor']      # 自動下單最低 RR
 TREND_AI_SEMI_TRADES = DATASET_POLICY['trend_ai_semi_trades']       # 趨勢學習 30 筆後半介入
 TREND_AI_FULL_TRADES = DATASET_POLICY['trend_ai_full_trades']       # 趨勢學習 50 筆後全介入
-AI_MIN_SAMPLE_EFFECT = DATASET_POLICY['ai_min_sample_effect']        # AI/參數學習至少 5 筆才開始影響決策
-SYMBOL_BLOCK_MIN_TRADES = DATASET_POLICY['symbol_block_min_trades']    # 同幣實單超過 10 筆才啟用封鎖
-SYMBOL_BLOCK_MIN_WINRATE = DATASET_POLICY['symbol_block_min_winrate'] # 同幣勝率低於 40% 停止再下
+AI_MIN_SAMPLE_EFFECT = min(int(DATASET_POLICY['ai_min_sample_effect'] or 5), 3)        # AI主控版：3筆就允許開始影響決策
+SYMBOL_BLOCK_MIN_TRADES = max(int(DATASET_POLICY['symbol_block_min_trades'] or 10), 18)    # AI主控版：幣種封鎖延後，避免太早卡死
+SYMBOL_BLOCK_MIN_WINRATE = min(float(DATASET_POLICY['symbol_block_min_winrate'] or 40), 35.0) # AI主控版：放寬幣種封鎖線
 STRATEGY_CAPITAL_MIN_TRADES = DATASET_POLICY['strategy_capital_min_trades']  # 策略資金放大至少要 5 筆以上
-STRATEGY_BLOCK_MIN_TRADES = DATASET_POLICY['strategy_block_min_trades']   # 策略封鎖至少要 11 筆以上
-STRATEGY_BLOCK_MIN_WINRATE = DATASET_POLICY['strategy_block_min_winrate']# 策略勝率低於 45% 停止再下
-NEUTRAL_REGIME_BLOCK = DECISION_POLICY['neutral_regime_block']      # 中性盤預設不主動開新單
+STRATEGY_BLOCK_MIN_TRADES = max(int(DATASET_POLICY['strategy_block_min_trades'] or 11), 20)   # AI主控版：策略封鎖延後啟用
+STRATEGY_BLOCK_MIN_WINRATE = min(float(DATASET_POLICY['strategy_block_min_winrate'] or 45), 38.0)# AI主控版：放寬策略封鎖線
+NEUTRAL_REGIME_BLOCK = False      # AI主控版：中性盤可交易，但由 AI 自行縮倉/降分
 LEARNING_DATASET_META = build_learning_dataset_meta(reset_from=env_or_blank('TREND_LEARNING_RESET_FROM', ''))
 TREND_LEARNING_RESET_FROM = LEARNING_DATASET_META.get('activated_from', '') or None  # 舊資料先納入，待新版實單累積足夠後再切換
 LEGACY_BOOTSTRAP_MIN_NEW_TRADES = max(int(TREND_AI_FULL_TRADES or 50), 50)
@@ -236,7 +236,7 @@ RISK_LOCK = threading.Lock()
 
 # ── 動態門檻狀態 ──
 _DT = {
-    "current":          60,   # 當前門檻（最低只降到55）
+    "current":          48,   # AI主控版起始門檻
     "last_order_time":  None, # 最近下單時間
     "full_rounds":      0,    # 連續滿倉輪數
     "empty_rounds":     0,    # 門檻55時連續空倉輪數
@@ -245,10 +245,10 @@ _DT = {
 _DT_LOCK = threading.Lock()
 
 def _estimate_ai_threshold_target(top_sigs=None):
-    """由 AI 評分後的候選訊號品質自動估計門檻，避免再用固定 RR/EQ 公式卡死。"""
+    """由 AI 評分後的候選訊號品質自動估計門檻，AI 主控版預設更願意探索。"""
     sigs = list(top_sigs or [])[:8]
     if not sigs:
-        return 56.0, '無候選訊號，維持觀察'
+        return 49.0, '無候選訊號，AI低門檻待命'
 
     scored = []
     for sig in sigs:
@@ -262,42 +262,42 @@ def _estimate_ai_threshold_target(top_sigs=None):
             anti_chase_ok = bool(sig.get('anti_chase_ok', True))
             profile = _ai_strategy_profile(str(sig.get('symbol') or ''), regime=str(sig.get('regime') or ((sig.get('breakdown') or {}).get('Regime')) or 'neutral'), setup=str(sig.get('setup_label') or ((sig.get('breakdown') or {}).get('Setup')) or ''))
             quality = 0.0
-            quality += (score - 50.0) / 18.0
-            quality += max(min((rr - 1.0) * 1.1, 1.8), -1.2)
-            quality += max(min((eq - 1.6) * 0.6, 1.2), -1.0)
-            quality += ai_cov * 2.8
-            quality += min(ai_scnt / 25.0, 1.8)
-            quality += regime_conf * 1.2
-            quality += float(profile.get('ev_per_trade', 0) or 0) * 14.0
-            quality += (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.03
+            quality += (score - 46.0) / 13.5
+            quality += max(min((rr - 1.0) * 1.35, 2.1), -1.0)
+            quality += max(min((eq - 1.35) * 0.85, 1.6), -0.7)
+            quality += ai_cov * 3.4
+            quality += min(ai_scnt / 14.0, 2.4)
+            quality += regime_conf * 1.4
+            quality += float(profile.get('ev_per_trade', 0) or 0) * 18.0
+            quality += (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.05
             if not anti_chase_ok:
-                quality -= 0.9
+                quality -= 0.35
             if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
-                quality -= 2.0
+                quality -= 1.1
             scored.append((quality, sig, profile))
         except Exception:
             continue
 
     if not scored:
-        return 56.0, '候選訊號不足，維持觀察'
+        return 49.0, '候選訊號不足，AI低門檻待命'
 
     scored.sort(key=lambda x: x[0], reverse=True)
     best_q = float(scored[0][0])
     avg_q = sum(float(x[0]) for x in scored[:3]) / max(min(3, len(scored)), 1)
     best_sig = scored[0][1]
     best_profile = scored[0][2]
-    target = 58.0 - avg_q * 2.2 - max(best_q - 1.0, 0.0) * 1.2
+    target = 52.5 - avg_q * 2.8 - max(best_q - 0.6, 0.0) * 1.55
     if bool(best_profile.get('ready')):
-        target -= 1.0
+        target -= 1.6
     if bool(best_profile.get('symbol_blocked')) or bool(best_profile.get('strategy_blocked')):
-        target += 3.0
-    target = max(40.0, min(74.0, target))
+        target += 1.5
+    target = max(44.0, min(62.0, target))
     note = 'AI主控 | top {:.1f} | cov {:.2f} | 樣本 {}'.format(abs(float(best_sig.get('score', 0) or 0)), float(((best_sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)), int(((best_sig.get('breakdown') or {}).get('AISampleCount', 0) or 0)))
     return round(target, 2), note
 
 
 def update_dynamic_threshold(top_sigs=None):
-    """AI 自主門檻：依 AI 分數覆蓋率、學習樣本與持倉壓力動態調整。"""
+    """AI 自主門檻：AI 主控版在沒單時會主動放寬，而不是越卡越高。"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
         dt = _DT
@@ -307,7 +307,7 @@ def update_dynamic_threshold(top_sigs=None):
         target, note = _estimate_ai_threshold_target(top_sigs)
         if pos_count >= MAX_OPEN_POSITIONS:
             dt['full_rounds'] = dt.get('full_rounds', 0) + 1
-            target += min(6.0, dt['full_rounds'] * 0.65)
+            target += min(3.0, dt['full_rounds'] * 0.45)
         else:
             dt['full_rounds'] = 0
 
@@ -317,26 +317,26 @@ def update_dynamic_threshold(top_sigs=None):
                 sig_score = abs(float(sig.get('score', 0) or 0))
                 ai_cov = float((sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)
                 pwin = float((sig.get('decision_calibrator') or {}).get('p_win_est', 0.5) or 0.5)
-                if sig_score >= max(48.0, target - 2.0) and (ai_cov >= 0.18 or pwin >= 0.51):
+                if sig_score >= max(44.0, target - 4.0) and (ai_cov >= 0.12 or pwin >= 0.50):
                     strong_count += 1
             except Exception:
                 pass
 
         if strong_count == 0:
             dt['no_order_rounds'] = dt.get('no_order_rounds', 0) + 1
-            target += min(2.5, dt['no_order_rounds'] * 0.45)
+            target -= min(4.0, dt['no_order_rounds'] * 0.9)
         else:
             dt['no_order_rounds'] = 0
             if strong_count >= 2:
-                target -= min(2.0, strong_count * 0.5)
+                target -= min(1.2, strong_count * 0.35)
 
         prev = float(dt.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
-        new_val = round(prev * 0.55 + float(target) * 0.45, 2)
-        new_val = max(40.0, min(74.0, new_val))
+        new_val = round(prev * 0.35 + float(target) * 0.65, 2)
+        new_val = max(44.0, min(64.0, new_val))
         dt['current'] = new_val
         ORDER_THRESHOLD = new_val
         dt['last_ai_note'] = note
-        phase = 'AI積極' if new_val <= 50 else 'AI均衡' if new_val <= 61 else 'AI保守'
+        phase = 'AI積極' if new_val <= 49 else 'AI均衡' if new_val <= 57 else 'AI保守'
         print('🧠 AI門檻更新 {:.1f} → {:.1f} | {}'.format(prev, new_val, note))
         update_state(threshold_info={
             'current': new_val,
@@ -349,20 +349,20 @@ def update_dynamic_threshold(top_sigs=None):
         })
 
 def record_order_placed():
-    """下單後僅做非常輕微的過熱抑制，不再把門檻拉回固定區間。"""
+    """下單後只做很輕的過熱抑制，避免把 AI 再次鎖死。"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
         _DT['last_order_time'] = datetime.now()
         _DT['no_order_rounds'] = 0
         _DT['empty_rounds'] = 0
         prev = float(_DT.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
-        nudged = round(min(prev + 0.8, 74.0), 2)
-        _DT['current'] = max(40.0, min(74.0, nudged))
+        nudged = round(min(prev + 0.35, 64.0), 2)
+        _DT['current'] = max(44.0, min(64.0, nudged))
         ORDER_THRESHOLD = _DT['current']
         print('↩️ AI門檻微調至{}（避免短時間過度連開）'.format(_DT['current']))
         update_state(threshold_info={
             'current': _DT['current'],
-            'phase': 'AI積極' if _DT['current'] <= 50 else 'AI均衡' if _DT['current'] <= 61 else 'AI保守',
+            'phase': 'AI積極' if _DT['current'] <= 49 else 'AI均衡' if _DT['current'] <= 57 else 'AI保守',
             'full_rounds': _DT.get('full_rounds', 0),
             'empty_rounds': _DT.get('empty_rounds', 0),
             'no_order_rounds': _DT.get('no_order_rounds', 0),
@@ -1368,11 +1368,6 @@ def load_backtest_db():
         return {"runs": [], "summary": {}, "latest": {}}
 
 
-def save_backtest_db(db):
-    try:
-        STORAGE.save_backtest_state(db)
-    except Exception as e:
-        print("回測DB儲存失敗: {}".format(e))
 
 
 def persist_trade_history_record(rec):
@@ -1926,8 +1921,8 @@ def _ai_risk_multiplier(symbol='', regime='neutral', setup='', score=0, breakdow
     elif ev < 0 or wr < 45:
         mult *= 0.78
         note = 'AI弱勢縮倉'
-    if NEUTRAL_REGIME_BLOCK and str(regime or 'neutral') == 'neutral':
-        mult *= 0.82
+    if str(regime or 'neutral') == 'neutral' and confidence < 0.55:
+        mult *= 0.94
     return round(clamp(mult, 0.5, 1.2), 4), note
 
 
@@ -2845,7 +2840,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         ai_conf_boost = max(0.0, p_win_est - 0.5) * 10.0 + ev_est * 12.0 + ai_cov * 2.0
         effective_score = score + rotation_adj + ai_score_adj + ai_conf_boost
         gating = {
-            'regime': bool(mkt_ok and (not (NEUTRAL_REGIME_BLOCK and regime == 'neutral' and phase == 'full'))),
+            'regime': bool(mkt_ok),
             'setup': True,
             'risk': bool(side_ok and same_dir_cnt < MAX_SAME_DIRECTION and symbol not in already_closing),
             'symbol': bool(symbol not in pos_syms and symbol not in SHORT_TERM_EXCLUDED and can_reenter_symbol(symbol) and sig.get('allowed', True)),
@@ -2975,7 +2970,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     effective_score = score + rotation_adj + ai_score_adj + max(0.0, (decision_calibrator.get('p_win_est', 0.5) - 0.5) * 8.0)
 
     gating = {
-        'regime': bool(mkt_ok and (not (NEUTRAL_REGIME_BLOCK and regime == 'neutral' and phase == 'full'))),
+        'regime': bool(mkt_ok),
         'setup': bool(eq >= min_entry_quality and rr >= rr_floor and fit_ok),
         'risk': bool(side_ok and same_dir_cnt < MAX_SAME_DIRECTION and symbol not in already_closing),
         'symbol': bool(symbol not in pos_syms and symbol not in SHORT_TERM_EXCLUDED and can_reenter_symbol(symbol) and sig.get('allowed', True)),
@@ -3019,15 +3014,13 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             reasons.append(str(profile.get('note')))
     else:
         hard_block = bool(profile.get('hard_block'))
-        if NEUTRAL_REGIME_BLOCK and regime == 'neutral':
-            hard_block = True
-            reasons.append('中性盤禁新單')
+        if regime == 'neutral':
+            reasons.append('中性盤允許交易，但交由AI縮倉與校準')
         if not fit_ok:
             hard_block = True
             reasons.append(fit_note)
-        if int(profile.get('sample_count', 0) or 0) < AI_MIN_SAMPLE_EFFECT and score < max(ai_threshold + 5.0, 58.0):
-            hard_block = True
-            reasons.append('局部樣本不足')
+        if int(profile.get('sample_count', 0) or 0) < AI_MIN_SAMPLE_EFFECT and score < max(ai_threshold + 9.0, 63.0):
+            reasons.append('局部樣本不足，但保留探索模式')
         ai_ok = not hard_block
         if profile.get('ready'):
             reasons.append('AI策略已就緒')
@@ -3237,10 +3230,10 @@ def analyze_extension_risk(d15, direction_hint=0):
         bear3 = all(c.iloc[-i] < o.iloc[-i] for i in [1,2,3])
 
         if direction_hint >= 0 and ext > ANTI_CHASE_ATR and curr >= bb_up * 0.995 and bull3:
-            penalty = -10 if ext > 1.9 else -7
+            penalty = -6 if ext > 2.2 else -4
             return penalty, "多頭過度延伸，避免追高"
         if direction_hint <= 0 and ext < -ANTI_CHASE_ATR and curr <= bb_low * 1.005 and bear3:
-            penalty = 10 if ext < -1.9 else 7
+            penalty = 6 if ext < -2.2 else 4
             return penalty, "空頭過度延伸，避免追空"
         return 0, "延伸正常"
     except Exception:
@@ -4727,9 +4720,6 @@ def analyze_legacy_shadow_1(symbol):
 NEWS_CACHE = bot_news_disabled.disabled_news_state()
 NEWS_LOCK = threading.Lock()
 
-def get_cached_news_score():
-    with NEWS_LOCK:
-        return dict(NEWS_CACHE)
 
 def set_cached_news(score, sentiment, summary, latest_title):
     with NEWS_LOCK:
@@ -4741,11 +4731,7 @@ def set_cached_news(score, sentiment, summary, latest_title):
             "updated_at": time.time(),
         })
 
-def fetch_crypto_news():
-    return bot_news_disabled.fetch_crypto_news()
 
-def analyze_news_with_ai(news_list):
-    return bot_news_disabled.analyze_news_with_ai(news_list)
 
 def news_thread():
     bot_news_disabled.news_thread(update_state=update_state, set_cached_news=set_cached_news, sleep_sec=300)
@@ -6874,32 +6860,7 @@ def watchdog(target_func, name):
         print("=== 執行緒5秒後重啟: {} ===".format(name))
         time.sleep(5)
 
-def start_all_threads_legacy_shadow_1():
-    # 啟動時恢復備份狀態
-    load_full_state()
-    load_risk_state()
-    threads = [
-        (news_thread,            "news"),
-        (position_thread,        "position"),
-        (scan_thread,            "scan"),
-        (trailing_stop_thread,   "trailing"),
-        (session_monitor_thread, "session"),
-        (market_analysis_thread,  "market"),
-        (fvg_order_monitor_thread,"fvg_monitor"),
-    ]
-    for fn, name in threads:
-        t = threading.Thread(
-            target=watchdog,
-            args=(fn, name),
-            daemon=True,
-            name=name
-        )
-        t.start()
-    print("=== 所有執行緒已啟動（含守護重啟機制）===")
 
-def post_fork(server, worker):
-    start_all_threads()
-    print("=== [worker {}] 啟動完成 ===".format(worker.pid))
 
 
 
@@ -7226,216 +7187,6 @@ def _grade_signal_v6(direction_conf, setup_q, rr, anti_chase_penalty, htf_penalt
     return 'D'
 
 
-def analyze_legacy_shadow_2(symbol):
-    is_major = symbol in MAJOR_COINS
-    try:
-        d15 = pd.DataFrame(exchange.fetch_ohlcv(symbol, '15m', limit=120), columns=['t','o','h','l','c','v'])
-        time.sleep(0.18)
-        d4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=80), columns=['t','o','h','l','c','v'])
-        time.sleep(0.18)
-        d1d = pd.DataFrame(exchange.fetch_ohlcv(symbol, '1d', limit=60), columns=['t','o','h','l','c','v'])
-        time.sleep(0.08)
-        if len(d15) < 80 or len(d4h) < 40 or len(d1d) < 40:
-            return 0, '資料不足', 0, 0, 0, 0, {}, 0, 0, 0, 2.0, 3.0
-
-        curr = float(d15['c'].iloc[-1])
-        atr15 = max(safe_last(ta.atr(d15['h'], d15['l'], d15['c'], length=14), curr * 0.004), curr * 0.003)
-        atr4h = max(safe_last(ta.atr(d4h['h'], d4h['l'], d4h['c'], length=14), curr * 0.008), curr * 0.006)
-        atr = atr15
-        breakdown = {}
-        tags = []
-
-        side, direction_conf, direction_label, direction_strong, adx15, adx4 = _direction_profile_v6(d15, d4h, d1d)
-        direction_conf_view = max(0.0, min(10.0, direction_conf * 2.2 + max(adx15 - 15.0, 0.0) * 0.08 + max(adx4 - 15.0, 0.0) * 0.05 + (0.8 if direction_strong else 0.0)))
-        breakdown['方向信心'] = round(direction_conf_view, 1)
-        breakdown['ADX15'] = round(adx15, 1)
-        breakdown['ADX4H'] = round(adx4, 1)
-        tags.append(direction_label)
-
-        if side == 0:
-            return 0, '震盪過濾|方向不足', curr, 0, 0, 0, {'方向信心':0, 'Setup':'NoTrade', '等級':'D'}, atr, atr15, atr4h, 2.0, 3.0
-
-        setup = _best_setup_v6(d15, side)
-        if not setup:
-            # 沒有明確觸發，維持觀察；AI 仍可依歷史表現微調等待分數，避免整批訊號長期僵死。
-            wait_profile = _ai_adaptive_scoring_profile(symbol, regime='neutral', setup='wait', side=side, direction_conf_view=direction_conf_view, setup_q=0.0, rr_ratio=1.15)
-            base = 22 + direction_conf_view * (3.7 + max(wait_profile.get('w_dir', 6.9) - 6.9, -0.6)) + max(adx15 - 18.0, 0.0) * 0.32 + float(wait_profile.get('bias', 0.0) or 0.0)
-            capped = min(base, 44)
-            wait_quality = round(max(2.2, min(6.8, direction_conf_view * 0.44 + max(adx15 - 16.0, 0.0) * 0.08 + max(adx4 - 16.0, 0.0) * 0.05 + float(wait_profile.get('quality_adj', 0.0) or 0.0) * 0.18)), 2)
-            wait_trend_conf = round(max(0.0, min(direction_conf_view * 9.6 + max(adx4 - 15.0, 0.0) * 1.28 + float(wait_profile.get('bias', 0.0) or 0.0) * 1.2, 99.0)), 1)
-            wait_regime_conf = round(max(0.0, min(direction_conf_view * 8.5 + max(adx15 - 14.0, 0.0) * 1.08 + float(wait_profile.get('bias', 0.0) or 0.0) * 0.9, 99.0)), 1)
-            wait_direction = round(max(direction_conf_view * 0.62 + wait_trend_conf / 21.0 + wait_regime_conf / 25.0, wait_trend_conf / 10.8, wait_regime_conf / 11.8), 1)
-            wait_grade = _grade_signal_v6(wait_direction, wait_quality, 1.15, 0, 0)
-            return side * capped, '方向有但未到觸發位|等待回踩/突破確認', curr, 0, 0, 0, {
-                '方向信心': wait_direction, 'Setup':'等待觸發', '進場品質': wait_quality, 'RR':0, '等級':wait_grade,
-                'TrendConfidence': wait_trend_conf,
-                'RegimeConfidence': wait_regime_conf,
-                'AI評分模式': '|'.join((wait_profile.get('notes') or [])[:3]),
-            }, atr, atr15, atr4h, 2.0, 3.0
-
-        setup_label = setup['setup_label']
-        entry = float(setup['entry'])
-        sl = float(setup['sl'])
-        tp = float(setup['tp'])
-        setup_q = float(setup['setup_quality'])
-        tags.append(setup_label)
-        breakdown['Setup'] = setup_label
-
-        current_regime = 'neutral'
-        try:
-            current_regime = str((_fetch_regime_for_symbol(symbol) or {}).get('regime', 'neutral'))
-        except Exception:
-            current_regime = 'neutral'
-        base_sl_mult = round(abs(entry - sl) / max(atr15, 1e-9), 2)
-        base_tp_mult = round(abs(tp - entry) / max(atr15, 1e-9), 2)
-        learned_rr = get_learned_rr_target(
-            symbol,
-            current_regime,
-            setup_label,
-            [k for k, v in breakdown.items() if v != 0] + [setup_label],
-            base_sl_mult,
-            base_tp_mult,
-        )
-        risk_dist = abs(entry - sl)
-        if side > 0:
-            tp = entry + risk_dist * learned_rr
-        else:
-            tp = entry - risk_dist * learned_rr
-
-        ema21 = safe_last(ta.ema(d15['c'], length=21), curr)
-        ext_atr = abs(curr - ema21) / max(atr15, 1e-9)
-        anti_chase_penalty = 0
-        if ext_atr > 1.35:
-            anti_chase_penalty += 9
-            tags.append('追價風險高')
-        elif ext_atr > 1.05:
-            anti_chase_penalty += 4
-            tags.append('偏離均線')
-
-        # 靠近4H反向極值時降權
-        hh4 = float(d4h['h'].tail(30).max())
-        ll4 = float(d4h['l'].tail(30).min())
-        htf_penalty = 0
-        if side > 0 and (hh4 - curr) / max(atr4h, 1e-9) < 0.55:
-            htf_penalty += 5
-            tags.append('接近4H壓力')
-        if side < 0 and (curr - ll4) / max(atr4h, 1e-9) < 0.55:
-            htf_penalty += 5
-            tags.append('接近4H支撐')
-
-        rr_ratio = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-        breakdown['LearnedRR'] = round(learned_rr, 2)
-        if rr_ratio < 1.55:
-            htf_penalty += 8
-            tags.append('風報比不足')
-        elif rr_ratio >= 2.3:
-            tags.append('風報比優秀')
-
-        # 補上少量輔助因子，但不再讓它們主導方向
-        rsi = safe_last(ta.rsi(d15['c'], length=14), 50)
-        macd = ta.macd(d15['c'])
-        hist = safe_last(macd['MACDh_12_26_9'], 0) if macd is not None and 'MACDh_12_26_9' in macd else 0
-        helper = 0
-        if side > 0:
-            if 46 <= rsi <= 66:
-                helper += 5; tags.append('RSI多頭甜蜜區')
-            elif rsi > 74:
-                helper -= 4; tags.append('RSI過熱')
-            if hist > 0:
-                helper += 4; tags.append('MACD順多')
-        else:
-            if 34 <= rsi <= 54:
-                helper += 5; tags.append('RSI空頭甜蜜區')
-            elif rsi < 26:
-                helper -= 4; tags.append('RSI過冷')
-            if hist < 0:
-                helper += 4; tags.append('MACD順空')
-
-        # 大盤同向加分，逆向扣分
-        try:
-            with MARKET_LOCK:
-                mdir = MARKET_STATE.get('direction', '中性')
-            if side > 0 and mdir in ('多', '強多'):
-                helper += 4; tags.append('大盤順風')
-            elif side < 0 and mdir in ('空', '強空'):
-                helper += 4; tags.append('大盤順風')
-            elif mdir != '中性':
-                helper -= 3; tags.append('大盤逆風')
-        except Exception:
-            pass
-
-        rr_feat = max(0.0, min(1.25, (rr_ratio - 1.0) / 1.35))
-        dir_feat = max(0.0, min(1.0, direction_conf_view / 10.0))
-        setup_feat = max(0.0, min(1.0, setup_q / 10.0))
-        momentum_feat = max(0.0, min(1.0, (helper + 10.0) / 20.0))
-        anti_feat = max(0.0, min(1.0, anti_chase_penalty / 12.0))
-        htf_feat = max(0.0, min(1.0, htf_penalty / 12.0))
-        ai_adapt = _ai_adaptive_scoring_profile(symbol, regime=current_regime, setup=setup_label, side=side, direction_conf_view=direction_conf_view, setup_q=setup_q, rr_ratio=rr_ratio)
-        pos_score = (
-            dir_feat * float(ai_adapt.get('w_dir', 1.0) or 1.0)
-            + setup_feat * float(ai_adapt.get('w_setup', 1.0) or 1.0)
-            + rr_feat * float(ai_adapt.get('w_rr', 1.0) or 1.0)
-            + momentum_feat * float(ai_adapt.get('w_momentum', 1.0) or 1.0)
-        )
-        neg_score = (
-            anti_feat * float(ai_adapt.get('w_anti', 1.0) or 1.0)
-            + htf_feat * float(ai_adapt.get('w_htf', 1.0) or 1.0)
-        )
-        denom = max(
-            float(ai_adapt.get('w_dir', 1.0) or 1.0)
-            + float(ai_adapt.get('w_setup', 1.0) or 1.0)
-            + float(ai_adapt.get('w_rr', 1.0) or 1.0)
-            + float(ai_adapt.get('w_momentum', 1.0) or 1.0)
-            + float(ai_adapt.get('w_anti', 1.0) or 1.0)
-            + float(ai_adapt.get('w_htf', 1.0) or 1.0),
-            1e-9,
-        )
-        net_strength = (pos_score - neg_score) / denom
-        if direction_strong:
-            net_strength += 0.035
-        net_strength += float(ai_adapt.get('bias', 0.0) or 0.0)
-        score_abs = round(max(0.0, min(100.0, 50.0 + net_strength * 58.0)), 1)
-        score = round(score_abs if side > 0 else -score_abs, 1)
-
-        sl_mult = round(abs(entry - sl) / max(atr15, 1e-9), 2)
-        tp_mult = round(abs(tp - entry) / max(atr15, 1e-9), 2)
-        est_pnl = round(abs(tp - entry) / max(entry, 1e-9) * 100 * 20, 2)
-        entry_quality = round(max(1.0, min(10.0, (setup_feat * 6.2 + dir_feat * 2.1 + rr_feat * 1.4 - anti_feat * 0.7 - htf_feat * 0.6) * 1.55 + float(ai_adapt.get('quality_adj', 0.0) or 0.0) * 0.15)), 1)
-        direction_for_grade = max(direction_conf_view, min(9.9, direction_conf_view + float(ai_adapt.get('bias', 0.0) or 0.0) * 2.0))
-        grade = _grade_signal_v6(direction_for_grade, entry_quality, rr_ratio, anti_chase_penalty, htf_penalty)
-
-        breakdown['進場品質'] = entry_quality
-        breakdown['RR'] = round(rr_ratio, 2)
-        breakdown['Setup'] = setup_label
-        trend_conf_val = round(max(0.0, min(99.0, (dir_feat * float(ai_adapt.get('w_dir', 1.0) or 1.0) + setup_feat * float(ai_adapt.get('w_setup', 1.0) or 1.0) + rr_feat * float(ai_adapt.get('w_rr', 1.0) or 1.0) - anti_feat * float(ai_adapt.get('w_anti', 1.0) or 1.0) * 0.6 - htf_feat * float(ai_adapt.get('w_htf', 1.0) or 1.0) * 0.45) / max((float(ai_adapt.get('w_dir', 1.0) or 1.0) + float(ai_adapt.get('w_setup', 1.0) or 1.0) + float(ai_adapt.get('w_rr', 1.0) or 1.0) + float(ai_adapt.get('w_anti', 1.0) or 1.0) * 0.6 + float(ai_adapt.get('w_htf', 1.0) or 1.0) * 0.45), 1e-9) * 100.0)), 1)
-        regime_conf_val = round(max(0.0, min(99.0, (dir_feat * 0.65 + momentum_feat * 0.22 + rr_feat * 0.18 - htf_feat * 0.14 - anti_feat * 0.12 + float(ai_adapt.get('bias', 0.0) or 0.0) * 0.2) * 100.0)), 1)
-        direction_display = round(max(direction_conf_view, trend_conf_val / 10.0, regime_conf_val / 10.5), 1)
-        breakdown['方向信心'] = round(max(direction_display, 0.0), 1)
-        breakdown['TrendConfidence'] = trend_conf_val
-        breakdown['RegimeConfidence'] = regime_conf_val
-        breakdown['RegimeBias'] = side * round(direction_conf_view, 2)
-        breakdown['追價風險'] = -anti_chase_penalty if side > 0 else anti_chase_penalty
-        breakdown['高階位階壓力'] = -htf_penalty if side > 0 else htf_penalty
-        breakdown['等級'] = grade
-        breakdown['輔助因子'] = helper if side > 0 else -helper
-        breakdown['AI評分模式'] = '|'.join((ai_adapt.get('notes') or [])[:4])
-        breakdown['AI權重'] = {
-            'dir': round(float(ai_adapt.get('w_dir', 1.0) or 1.0), 2),
-            'setup': round(float(ai_adapt.get('w_setup', 1.0) or 1.0), 2),
-            'rr': round(float(ai_adapt.get('w_rr', 1.0) or 1.0), 2),
-            'mom': round(float(ai_adapt.get('w_momentum', 1.0) or 1.0), 2),
-            'anti': round(float(ai_adapt.get('w_anti', 1.0) or 1.0), 2),
-            'htf': round(float(ai_adapt.get('w_htf', 1.0) or 1.0), 2),
-            'bias': round(float(ai_adapt.get('bias', 0) or 0), 2),
-        }
-
-        desc = '|'.join(tags[:8])
-        return score, desc, round(entry, 6), round(sl, 6), round(tp, 6), est_pnl, breakdown, atr, atr15, atr4h, sl_mult, tp_mult
-
-    except Exception as e:
-        import traceback
-        print('analyze {} 失敗(v6): {}\n{}'.format(symbol, e, traceback.format_exc()[-400:]))
-        return 0, '錯誤:{}'.format(str(e)[:40]), 0, 0, 0, 0, {}, 0, 0, 0, 2.0, 3.0
 
 
 # =====================================================
@@ -8756,71 +8507,8 @@ def run_multi_market_backtest(symbols=None):
     update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE))
     return results
 
-def auto_backtest_thread():
-    while True:
-        try:
-            with AI_LOCK:
-                AUTO_BACKTEST_STATE['running'] = True
-                AUTO_BACKTEST_STATE['summary'] = '自動回測中...'
-            sync_ai_state_to_dashboard(force_regime=False)
-            run_multi_market_backtest()
-            sync_ai_state_to_dashboard(force_regime=False)
-        except Exception as e:
-            print('自動回測執行緒失敗:', e)
-            with AI_LOCK:
-                AUTO_BACKTEST_STATE['running'] = False
-                AUTO_BACKTEST_STATE['summary'] = '回測失敗: {}'.format(str(e)[:80])
-        time.sleep(AI_BACKTEST_SLEEP_SEC)
 
-def memory_guard_thread():
-    while True:
-        try:
-            now_ts = time.time()
-            with CACHE_LOCK:
-                for sym, meta in list(SIGNAL_META_CACHE.items()):
-                    ts = float((meta or {}).get('ts', 0) or 0) if isinstance(meta, dict) else 0.0
-                    if ts and now_ts - ts > 900:
-                        SIGNAL_META_CACHE.pop(sym, None)
-                        SCORE_CACHE.pop(sym, None)
-                for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS]:
-                    prune_mapping(cache, max_size=500, prune_count=200)
-            with PROTECTION_LOCK:
-                prune_mapping(PROTECTION_STATE, max_size=500, prune_count=200)
-            with AI_LOCK:
-                AI_PANEL['memory'] = {'score_cache': len(SCORE_CACHE),'signal_meta_cache': len(SIGNAL_META_CACHE),'entry_locks': len(ENTRY_LOCKS),'protection_state': len(PROTECTION_STATE),'fvg_orders': len(FVG_ORDERS)}
-            gc.collect()
-            update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE))
-        except Exception as e:
-            print('記憶體守護失敗:', e)
-        time.sleep(120)
 
-def enhanced_position_thread():
-    while True:
-        try:
-            with TRAILING_LOCK:
-                for sym, ts in list(TRAILING_STATE.items()):
-                    side = str(ts.get('side', '')).lower()
-                    entry = float(ts.get('entry_price', 0) or 0)
-                    atr = float(ts.get('atr', 0) or 0)
-                    if entry <= 0 or atr <= 0: continue
-                    ticker = exchange.fetch_ticker(sym)
-                    mark = float(ticker.get('last', 0) or 0)
-                    if mark <= 0: continue
-                    params = get_regime_params((AI_PANEL.get('symbol_regimes', {}).get(sym) or {}).get('regime', 'neutral'))
-                    breakeven_atr = float(params.get('breakeven_atr', 0.9))
-                    trail_trigger_atr = float(params.get('trail_trigger_atr', 1.4))
-                    trail_pct = float(params.get('trail_pct', ts.get('trail_pct', 0.035)))
-                    if side in ('buy', 'long'):
-                        profit_atr = (mark - entry) / max(atr, 1e-9)
-                        if profit_atr >= breakeven_atr: ts['initial_sl'] = max(float(ts.get('initial_sl', 0) or 0), entry)
-                        if profit_atr >= trail_trigger_atr: ts['trail_pct'] = min(float(ts.get('trail_pct', trail_pct) or trail_pct), trail_pct)
-                    elif side in ('sell', 'short'):
-                        profit_atr = (entry - mark) / max(atr, 1e-9)
-                        if profit_atr >= breakeven_atr: ts['initial_sl'] = min(float(ts.get('initial_sl', entry * 9) or entry * 9), entry)
-                        if profit_atr >= trail_trigger_atr: ts['trail_pct'] = min(float(ts.get('trail_pct', trail_pct) or trail_pct), trail_pct)
-        except Exception as e:
-            print('強化保本/動態止盈失敗:', e)
-        time.sleep(8)
 
 
 
@@ -9530,7 +9218,8 @@ def apply_execution_guard(symbol, side, margin_pct):
         return {'allow': True, 'margin_pct': mp, 'snapshot': snap, 'gate': gate}
     except Exception as e:
         API_ERROR_STREAK = min(API_ERROR_STREAK + 1, 10)
-        return {'allow': False, 'margin_pct': margin_pct, 'snapshot': {'error': str(e)}, 'gate': {'action': 'pause', 'reasons': ['execution guard error']}}
+        softened_margin = float(margin_pct or 0) * 0.45
+        return {'allow': True, 'margin_pct': softened_margin, 'snapshot': {'error': str(e)}, 'gate': {'action': 'penalty', 'softened': True, 'score_penalty': 5.0, 'margin_mult': 0.45, 'reasons': ['execution guard error，改降倉處理']}}
 
 
 
