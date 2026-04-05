@@ -1562,14 +1562,16 @@ def get_trend_live_trades(closed_only=False):
     return merged if merged else rows
 
 def _trade_learn_metric(trade):
-    """AI learning metric: use account impact when available, otherwise fallback safely.
-    - learn_pnl_pct: preferred persistent field
-    - account_pnl_pct: leverage * margin normalized account impact
+    """AI learning metric.
+    Priority:
+    - learn_pnl_pct: AI primary learning metric (prefer final realized close PnL converted from exchange)
+    - leveraged_pnl_pct: realized ROI on used margin / leverage view
+    - account_pnl_pct: realized account impact
     - pnl_pct: legacy fallback
     """
     if not isinstance(trade, dict):
         return 0.0
-    for k in ("learn_pnl_pct", "account_pnl_pct", "pnl_pct"):
+    for k in ("learn_pnl_pct", "leveraged_pnl_pct", "account_pnl_pct", "pnl_pct"):
         v = trade.get(k, None)
         if v is not None:
             try:
@@ -5463,20 +5465,31 @@ def learn_from_closed_trade_legacy_shadow_1(trade_id):
         side = trade["side"]
         exit_p = float(trade.get("exit_price", 0) or 0)
         entry_p = float(trade.get("entry_price", 0) or 0)
-        leverage = float(trade.get("leverage", 1) or 1)
+        leverage = float(trade.get("leverage", trade.get("planned_leverage", 1)) or 1)
         margin_pct = float(trade.get("margin_pct", RISK_PCT) or RISK_PCT)
+        realized_pnl_usdt = float(trade.get("realized_pnl_usdt", 0) or 0)
+        used_margin_usdt = float(trade.get("used_margin_usdt", trade.get("order_usdt", 0)) or 0)
+        entry_equity = float(trade.get("entry_equity", STATE.get("equity", 0)) or 0)
 
         # 1) 純價格邊際（不含槓桿）
         raw_pct = ((exit_p - entry_p) / max(entry_p, 1e-9) * 100.0) if side == "buy" else ((entry_p - exit_p) / max(entry_p, 1e-9) * 100.0)
 
-        # 2) 交易所視角損益（含槓桿，不含保證金占比）
-        leveraged_pnl_pct = raw_pct * max(leverage, 1.0)
+        # 2) 交易所最終已實現損益（優先）→ 轉成保證金 ROI，避免學習值總是接近 0
+        leveraged_pnl_pct = None
+        if abs(realized_pnl_usdt) > 1e-12 and used_margin_usdt > 1e-9:
+            leveraged_pnl_pct = (realized_pnl_usdt / used_margin_usdt) * 100.0
+        if leveraged_pnl_pct is None:
+            leveraged_pnl_pct = raw_pct * max(leverage, 1.0)
 
-        # 3) 帳戶視角損益（含槓桿與保證金占比）→ 給 AI 與 UI 學習/統計主用
-        account_pnl_pct = leveraged_pnl_pct * max(margin_pct, 0.0001)
+        # 3) 帳戶視角損益（實際已實現損益 / 進場時資產）；拿不到時才退回舊估算
+        account_pnl_pct = None
+        if abs(realized_pnl_usdt) > 1e-12 and entry_equity > 1e-9:
+            account_pnl_pct = (realized_pnl_usdt / entry_equity) * 100.0
+        if account_pnl_pct is None:
+            account_pnl_pct = leveraged_pnl_pct * max(margin_pct, 0.0001)
 
-        # 給 AI 學習的主口徑：實際帳戶影響，不再被壓成 -0.0
-        learn_pnl_pct = account_pnl_pct
+        # 給 AI 學習的主口徑：優先使用交易所最終已實現損益換算後的真實結果
+        learn_pnl_pct = leveraged_pnl_pct
         result = "win" if learn_pnl_pct > 0 else "loss"
 
         time.sleep(60)
@@ -5619,10 +5632,13 @@ def learn_from_closed_trade_legacy_shadow_1(trade_id):
         except Exception:
             pass
 
-        # 風控用 USDT 盈虧：優先使用實際已記錄，否則用帳戶損益近似
+        # 風控用 USDT 盈虧：優先使用交易所最終已實現損益，否則才退回估算
         pnl_usdt = float(trade.get("realized_pnl_usdt", 0) or 0)
-        if pnl_usdt == 0:
-            pnl_usdt = (learn_pnl_pct / 100.0) * float(STATE.get("equity", 10) or 10)
+        if abs(pnl_usdt) <= 1e-12:
+            base_usdt = float(trade.get("used_margin_usdt", trade.get("order_usdt", 0)) or 0)
+            if base_usdt <= 1e-9:
+                base_usdt = float(STATE.get("equity", 10) or 10)
+            pnl_usdt = (learn_pnl_pct / 100.0) * base_usdt
         record_trade_result(pnl_usdt)
         update_state(risk_status=get_risk_status())
         _refresh_learn_summary()
@@ -6377,6 +6393,7 @@ def place_order(sig):
         learn_rec={"id":trade_id,"symbol":sym,"side":side,"entry_price":sig['price'],
                    "entry_score":sig['score'],"breakdown":sig.get('breakdown',{}),
                    "atr_mult_sl":sig.get('sl_mult',2.0),"atr_mult_tp":sig.get('tp_mult',3.0),"margin_pct":used_margin_pct,"margin_learning_mult":margin_ctx.get('learning_mult',1.0),"scale_mode":sig.get('scale_plan',{}).get('mode','single'),
+                   "order_usdt":round(order_usdt, 4),"used_margin_usdt":round(order_usdt, 4),"entry_equity":round(float(equity or 0), 4),"planned_leverage":round(float(lev or 0), 4),
                    "entry_time":tw_now_str("%Y-%m-%d %H:%M:%S"),
                    "exit_price":None,"exit_time":None,"pnl_pct":None,
                    "setup_label":sig.get('setup_label') or sig.get('breakdown',{}).get('Setup',''),
