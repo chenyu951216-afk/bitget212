@@ -1,4 +1,4 @@
-import os, sys, ccxt, threading, time, requests, gc, json, math
+import os, sys, ccxt, threading, time, gc, json, math
 import numpy as np
 sys.stdout.reconfigure(line_buffering=True)  # 即時 flush logs
 import pandas as pd
@@ -10,20 +10,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from bot_runtime_utils import atomic_json_load, atomic_json_save, prune_mapping, safe_request_json, safe_request_text, snapshot_mapping
+from bot_runtime_utils import atomic_json_load, atomic_json_save, prune_mapping, snapshot_mapping
 from bot_market_guard import MarketDirectionGuard
 from bot_storage import BotStorage
 import bot_news_disabled
-from ai_dataset_guard import build_learning_weights as ext_build_learning_weights, learning_weight_summary as ext_learning_weight_summary
+from ai_dataset_guard import learning_weight_summary as ext_learning_weight_summary
 from ai_observer_tools import trigger_hit_leaderboard, neutral_failure_stats
 from ai_execution_guard import exchange_quality_snapshot as exec_quality_snapshot, execution_gate, protection_failure_action
 from ai_replay_store import save_decision_input_snapshot, load_decision_input_snapshots, ensure_replay_tables
 from ai_market_context import build_market_consensus
-from ai_session_tools import session_bucket_from_hour, build_session_bias as build_ext_session_bias
+from ai_session_tools import session_bucket_from_hour
 from ai_risk_alerts import derive_auto_mode
 from ai_decision_intelligence import apply_decision_inertia, detect_market_tempo, classify_exit_type, weighted_trade_stats, recent_setup_loss_streak, confidence_position_multiplier, apply_exit_learning_to_params
 from learning_engine import enrich_learning_trade, filter_learning_pool, phase_from_counts, build_decision_fingerprint, execution_quality_bucket
-from routes_ai import build_ai_db_stats_payload, build_ai_learning_recent_payload, build_ai_debug_payload, build_ai_learning_health_payload, build_ai_strategy_matrix_payload, build_ai_decision_explain_payload, build_learning_sample_review_payload
+from routes_ai import build_ai_learning_recent_payload, build_ai_debug_payload, build_ai_learning_health_payload, build_ai_strategy_matrix_payload, build_ai_decision_explain_payload, build_learning_sample_review_payload
 from state_service import env_or_blank, build_learning_dataset_meta, DEFAULT_RUNTIME_STATE
 from decision_calibrator import calibrate_trade_decision
 from execution_engine import execution_score_from_snapshot
@@ -1368,11 +1368,6 @@ def load_backtest_db():
         return {"runs": [], "summary": {}, "latest": {}}
 
 
-def save_backtest_db(db):
-    try:
-        STORAGE.save_backtest_state(db)
-    except Exception as e:
-        print("回測DB儲存失敗: {}".format(e))
 
 
 def persist_trade_history_record(rec):
@@ -4727,9 +4722,6 @@ def analyze_legacy_shadow_1(symbol):
 NEWS_CACHE = bot_news_disabled.disabled_news_state()
 NEWS_LOCK = threading.Lock()
 
-def get_cached_news_score():
-    with NEWS_LOCK:
-        return dict(NEWS_CACHE)
 
 def set_cached_news(score, sentiment, summary, latest_title):
     with NEWS_LOCK:
@@ -4741,11 +4733,7 @@ def set_cached_news(score, sentiment, summary, latest_title):
             "updated_at": time.time(),
         })
 
-def fetch_crypto_news():
-    return bot_news_disabled.fetch_crypto_news()
 
-def analyze_news_with_ai(news_list):
-    return bot_news_disabled.analyze_news_with_ai(news_list)
 
 def news_thread():
     bot_news_disabled.news_thread(update_state=update_state, set_cached_news=set_cached_news, sleep_sec=300)
@@ -6874,32 +6862,7 @@ def watchdog(target_func, name):
         print("=== 執行緒5秒後重啟: {} ===".format(name))
         time.sleep(5)
 
-def start_all_threads_legacy_shadow_1():
-    # 啟動時恢復備份狀態
-    load_full_state()
-    load_risk_state()
-    threads = [
-        (news_thread,            "news"),
-        (position_thread,        "position"),
-        (scan_thread,            "scan"),
-        (trailing_stop_thread,   "trailing"),
-        (session_monitor_thread, "session"),
-        (market_analysis_thread,  "market"),
-        (fvg_order_monitor_thread,"fvg_monitor"),
-    ]
-    for fn, name in threads:
-        t = threading.Thread(
-            target=watchdog,
-            args=(fn, name),
-            daemon=True,
-            name=name
-        )
-        t.start()
-    print("=== 所有執行緒已啟動（含守護重啟機制）===")
 
-def post_fork(server, worker):
-    start_all_threads()
-    print("=== [worker {}] 啟動完成 ===".format(worker.pid))
 
 
 
@@ -7226,216 +7189,6 @@ def _grade_signal_v6(direction_conf, setup_q, rr, anti_chase_penalty, htf_penalt
     return 'D'
 
 
-def analyze_legacy_shadow_2(symbol):
-    is_major = symbol in MAJOR_COINS
-    try:
-        d15 = pd.DataFrame(exchange.fetch_ohlcv(symbol, '15m', limit=120), columns=['t','o','h','l','c','v'])
-        time.sleep(0.18)
-        d4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=80), columns=['t','o','h','l','c','v'])
-        time.sleep(0.18)
-        d1d = pd.DataFrame(exchange.fetch_ohlcv(symbol, '1d', limit=60), columns=['t','o','h','l','c','v'])
-        time.sleep(0.08)
-        if len(d15) < 80 or len(d4h) < 40 or len(d1d) < 40:
-            return 0, '資料不足', 0, 0, 0, 0, {}, 0, 0, 0, 2.0, 3.0
-
-        curr = float(d15['c'].iloc[-1])
-        atr15 = max(safe_last(ta.atr(d15['h'], d15['l'], d15['c'], length=14), curr * 0.004), curr * 0.003)
-        atr4h = max(safe_last(ta.atr(d4h['h'], d4h['l'], d4h['c'], length=14), curr * 0.008), curr * 0.006)
-        atr = atr15
-        breakdown = {}
-        tags = []
-
-        side, direction_conf, direction_label, direction_strong, adx15, adx4 = _direction_profile_v6(d15, d4h, d1d)
-        direction_conf_view = max(0.0, min(10.0, direction_conf * 2.2 + max(adx15 - 15.0, 0.0) * 0.08 + max(adx4 - 15.0, 0.0) * 0.05 + (0.8 if direction_strong else 0.0)))
-        breakdown['方向信心'] = round(direction_conf_view, 1)
-        breakdown['ADX15'] = round(adx15, 1)
-        breakdown['ADX4H'] = round(adx4, 1)
-        tags.append(direction_label)
-
-        if side == 0:
-            return 0, '震盪過濾|方向不足', curr, 0, 0, 0, {'方向信心':0, 'Setup':'NoTrade', '等級':'D'}, atr, atr15, atr4h, 2.0, 3.0
-
-        setup = _best_setup_v6(d15, side)
-        if not setup:
-            # 沒有明確觸發，維持觀察；AI 仍可依歷史表現微調等待分數，避免整批訊號長期僵死。
-            wait_profile = _ai_adaptive_scoring_profile(symbol, regime='neutral', setup='wait', side=side, direction_conf_view=direction_conf_view, setup_q=0.0, rr_ratio=1.15)
-            base = 22 + direction_conf_view * (3.7 + max(wait_profile.get('w_dir', 6.9) - 6.9, -0.6)) + max(adx15 - 18.0, 0.0) * 0.32 + float(wait_profile.get('bias', 0.0) or 0.0)
-            capped = min(base, 44)
-            wait_quality = round(max(2.2, min(6.8, direction_conf_view * 0.44 + max(adx15 - 16.0, 0.0) * 0.08 + max(adx4 - 16.0, 0.0) * 0.05 + float(wait_profile.get('quality_adj', 0.0) or 0.0) * 0.18)), 2)
-            wait_trend_conf = round(max(0.0, min(direction_conf_view * 9.6 + max(adx4 - 15.0, 0.0) * 1.28 + float(wait_profile.get('bias', 0.0) or 0.0) * 1.2, 99.0)), 1)
-            wait_regime_conf = round(max(0.0, min(direction_conf_view * 8.5 + max(adx15 - 14.0, 0.0) * 1.08 + float(wait_profile.get('bias', 0.0) or 0.0) * 0.9, 99.0)), 1)
-            wait_direction = round(max(direction_conf_view * 0.62 + wait_trend_conf / 21.0 + wait_regime_conf / 25.0, wait_trend_conf / 10.8, wait_regime_conf / 11.8), 1)
-            wait_grade = _grade_signal_v6(wait_direction, wait_quality, 1.15, 0, 0)
-            return side * capped, '方向有但未到觸發位|等待回踩/突破確認', curr, 0, 0, 0, {
-                '方向信心': wait_direction, 'Setup':'等待觸發', '進場品質': wait_quality, 'RR':0, '等級':wait_grade,
-                'TrendConfidence': wait_trend_conf,
-                'RegimeConfidence': wait_regime_conf,
-                'AI評分模式': '|'.join((wait_profile.get('notes') or [])[:3]),
-            }, atr, atr15, atr4h, 2.0, 3.0
-
-        setup_label = setup['setup_label']
-        entry = float(setup['entry'])
-        sl = float(setup['sl'])
-        tp = float(setup['tp'])
-        setup_q = float(setup['setup_quality'])
-        tags.append(setup_label)
-        breakdown['Setup'] = setup_label
-
-        current_regime = 'neutral'
-        try:
-            current_regime = str((_fetch_regime_for_symbol(symbol) or {}).get('regime', 'neutral'))
-        except Exception:
-            current_regime = 'neutral'
-        base_sl_mult = round(abs(entry - sl) / max(atr15, 1e-9), 2)
-        base_tp_mult = round(abs(tp - entry) / max(atr15, 1e-9), 2)
-        learned_rr = get_learned_rr_target(
-            symbol,
-            current_regime,
-            setup_label,
-            [k for k, v in breakdown.items() if v != 0] + [setup_label],
-            base_sl_mult,
-            base_tp_mult,
-        )
-        risk_dist = abs(entry - sl)
-        if side > 0:
-            tp = entry + risk_dist * learned_rr
-        else:
-            tp = entry - risk_dist * learned_rr
-
-        ema21 = safe_last(ta.ema(d15['c'], length=21), curr)
-        ext_atr = abs(curr - ema21) / max(atr15, 1e-9)
-        anti_chase_penalty = 0
-        if ext_atr > 1.35:
-            anti_chase_penalty += 9
-            tags.append('追價風險高')
-        elif ext_atr > 1.05:
-            anti_chase_penalty += 4
-            tags.append('偏離均線')
-
-        # 靠近4H反向極值時降權
-        hh4 = float(d4h['h'].tail(30).max())
-        ll4 = float(d4h['l'].tail(30).min())
-        htf_penalty = 0
-        if side > 0 and (hh4 - curr) / max(atr4h, 1e-9) < 0.55:
-            htf_penalty += 5
-            tags.append('接近4H壓力')
-        if side < 0 and (curr - ll4) / max(atr4h, 1e-9) < 0.55:
-            htf_penalty += 5
-            tags.append('接近4H支撐')
-
-        rr_ratio = abs(tp - entry) / max(abs(entry - sl), 1e-9)
-        breakdown['LearnedRR'] = round(learned_rr, 2)
-        if rr_ratio < 1.55:
-            htf_penalty += 8
-            tags.append('風報比不足')
-        elif rr_ratio >= 2.3:
-            tags.append('風報比優秀')
-
-        # 補上少量輔助因子，但不再讓它們主導方向
-        rsi = safe_last(ta.rsi(d15['c'], length=14), 50)
-        macd = ta.macd(d15['c'])
-        hist = safe_last(macd['MACDh_12_26_9'], 0) if macd is not None and 'MACDh_12_26_9' in macd else 0
-        helper = 0
-        if side > 0:
-            if 46 <= rsi <= 66:
-                helper += 5; tags.append('RSI多頭甜蜜區')
-            elif rsi > 74:
-                helper -= 4; tags.append('RSI過熱')
-            if hist > 0:
-                helper += 4; tags.append('MACD順多')
-        else:
-            if 34 <= rsi <= 54:
-                helper += 5; tags.append('RSI空頭甜蜜區')
-            elif rsi < 26:
-                helper -= 4; tags.append('RSI過冷')
-            if hist < 0:
-                helper += 4; tags.append('MACD順空')
-
-        # 大盤同向加分，逆向扣分
-        try:
-            with MARKET_LOCK:
-                mdir = MARKET_STATE.get('direction', '中性')
-            if side > 0 and mdir in ('多', '強多'):
-                helper += 4; tags.append('大盤順風')
-            elif side < 0 and mdir in ('空', '強空'):
-                helper += 4; tags.append('大盤順風')
-            elif mdir != '中性':
-                helper -= 3; tags.append('大盤逆風')
-        except Exception:
-            pass
-
-        rr_feat = max(0.0, min(1.25, (rr_ratio - 1.0) / 1.35))
-        dir_feat = max(0.0, min(1.0, direction_conf_view / 10.0))
-        setup_feat = max(0.0, min(1.0, setup_q / 10.0))
-        momentum_feat = max(0.0, min(1.0, (helper + 10.0) / 20.0))
-        anti_feat = max(0.0, min(1.0, anti_chase_penalty / 12.0))
-        htf_feat = max(0.0, min(1.0, htf_penalty / 12.0))
-        ai_adapt = _ai_adaptive_scoring_profile(symbol, regime=current_regime, setup=setup_label, side=side, direction_conf_view=direction_conf_view, setup_q=setup_q, rr_ratio=rr_ratio)
-        pos_score = (
-            dir_feat * float(ai_adapt.get('w_dir', 1.0) or 1.0)
-            + setup_feat * float(ai_adapt.get('w_setup', 1.0) or 1.0)
-            + rr_feat * float(ai_adapt.get('w_rr', 1.0) or 1.0)
-            + momentum_feat * float(ai_adapt.get('w_momentum', 1.0) or 1.0)
-        )
-        neg_score = (
-            anti_feat * float(ai_adapt.get('w_anti', 1.0) or 1.0)
-            + htf_feat * float(ai_adapt.get('w_htf', 1.0) or 1.0)
-        )
-        denom = max(
-            float(ai_adapt.get('w_dir', 1.0) or 1.0)
-            + float(ai_adapt.get('w_setup', 1.0) or 1.0)
-            + float(ai_adapt.get('w_rr', 1.0) or 1.0)
-            + float(ai_adapt.get('w_momentum', 1.0) or 1.0)
-            + float(ai_adapt.get('w_anti', 1.0) or 1.0)
-            + float(ai_adapt.get('w_htf', 1.0) or 1.0),
-            1e-9,
-        )
-        net_strength = (pos_score - neg_score) / denom
-        if direction_strong:
-            net_strength += 0.035
-        net_strength += float(ai_adapt.get('bias', 0.0) or 0.0)
-        score_abs = round(max(0.0, min(100.0, 50.0 + net_strength * 58.0)), 1)
-        score = round(score_abs if side > 0 else -score_abs, 1)
-
-        sl_mult = round(abs(entry - sl) / max(atr15, 1e-9), 2)
-        tp_mult = round(abs(tp - entry) / max(atr15, 1e-9), 2)
-        est_pnl = round(abs(tp - entry) / max(entry, 1e-9) * 100 * 20, 2)
-        entry_quality = round(max(1.0, min(10.0, (setup_feat * 6.2 + dir_feat * 2.1 + rr_feat * 1.4 - anti_feat * 0.7 - htf_feat * 0.6) * 1.55 + float(ai_adapt.get('quality_adj', 0.0) or 0.0) * 0.15)), 1)
-        direction_for_grade = max(direction_conf_view, min(9.9, direction_conf_view + float(ai_adapt.get('bias', 0.0) or 0.0) * 2.0))
-        grade = _grade_signal_v6(direction_for_grade, entry_quality, rr_ratio, anti_chase_penalty, htf_penalty)
-
-        breakdown['進場品質'] = entry_quality
-        breakdown['RR'] = round(rr_ratio, 2)
-        breakdown['Setup'] = setup_label
-        trend_conf_val = round(max(0.0, min(99.0, (dir_feat * float(ai_adapt.get('w_dir', 1.0) or 1.0) + setup_feat * float(ai_adapt.get('w_setup', 1.0) or 1.0) + rr_feat * float(ai_adapt.get('w_rr', 1.0) or 1.0) - anti_feat * float(ai_adapt.get('w_anti', 1.0) or 1.0) * 0.6 - htf_feat * float(ai_adapt.get('w_htf', 1.0) or 1.0) * 0.45) / max((float(ai_adapt.get('w_dir', 1.0) or 1.0) + float(ai_adapt.get('w_setup', 1.0) or 1.0) + float(ai_adapt.get('w_rr', 1.0) or 1.0) + float(ai_adapt.get('w_anti', 1.0) or 1.0) * 0.6 + float(ai_adapt.get('w_htf', 1.0) or 1.0) * 0.45), 1e-9) * 100.0)), 1)
-        regime_conf_val = round(max(0.0, min(99.0, (dir_feat * 0.65 + momentum_feat * 0.22 + rr_feat * 0.18 - htf_feat * 0.14 - anti_feat * 0.12 + float(ai_adapt.get('bias', 0.0) or 0.0) * 0.2) * 100.0)), 1)
-        direction_display = round(max(direction_conf_view, trend_conf_val / 10.0, regime_conf_val / 10.5), 1)
-        breakdown['方向信心'] = round(max(direction_display, 0.0), 1)
-        breakdown['TrendConfidence'] = trend_conf_val
-        breakdown['RegimeConfidence'] = regime_conf_val
-        breakdown['RegimeBias'] = side * round(direction_conf_view, 2)
-        breakdown['追價風險'] = -anti_chase_penalty if side > 0 else anti_chase_penalty
-        breakdown['高階位階壓力'] = -htf_penalty if side > 0 else htf_penalty
-        breakdown['等級'] = grade
-        breakdown['輔助因子'] = helper if side > 0 else -helper
-        breakdown['AI評分模式'] = '|'.join((ai_adapt.get('notes') or [])[:4])
-        breakdown['AI權重'] = {
-            'dir': round(float(ai_adapt.get('w_dir', 1.0) or 1.0), 2),
-            'setup': round(float(ai_adapt.get('w_setup', 1.0) or 1.0), 2),
-            'rr': round(float(ai_adapt.get('w_rr', 1.0) or 1.0), 2),
-            'mom': round(float(ai_adapt.get('w_momentum', 1.0) or 1.0), 2),
-            'anti': round(float(ai_adapt.get('w_anti', 1.0) or 1.0), 2),
-            'htf': round(float(ai_adapt.get('w_htf', 1.0) or 1.0), 2),
-            'bias': round(float(ai_adapt.get('bias', 0) or 0), 2),
-        }
-
-        desc = '|'.join(tags[:8])
-        return score, desc, round(entry, 6), round(sl, 6), round(tp, 6), est_pnl, breakdown, atr, atr15, atr4h, sl_mult, tp_mult
-
-    except Exception as e:
-        import traceback
-        print('analyze {} 失敗(v6): {}\n{}'.format(symbol, e, traceback.format_exc()[-400:]))
-        return 0, '錯誤:{}'.format(str(e)[:40]), 0, 0, 0, 0, {}, 0, 0, 0, 2.0, 3.0
 
 
 # =====================================================
@@ -8756,71 +8509,8 @@ def run_multi_market_backtest(symbols=None):
     update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE))
     return results
 
-def auto_backtest_thread():
-    while True:
-        try:
-            with AI_LOCK:
-                AUTO_BACKTEST_STATE['running'] = True
-                AUTO_BACKTEST_STATE['summary'] = '自動回測中...'
-            sync_ai_state_to_dashboard(force_regime=False)
-            run_multi_market_backtest()
-            sync_ai_state_to_dashboard(force_regime=False)
-        except Exception as e:
-            print('自動回測執行緒失敗:', e)
-            with AI_LOCK:
-                AUTO_BACKTEST_STATE['running'] = False
-                AUTO_BACKTEST_STATE['summary'] = '回測失敗: {}'.format(str(e)[:80])
-        time.sleep(AI_BACKTEST_SLEEP_SEC)
 
-def memory_guard_thread():
-    while True:
-        try:
-            now_ts = time.time()
-            with CACHE_LOCK:
-                for sym, meta in list(SIGNAL_META_CACHE.items()):
-                    ts = float((meta or {}).get('ts', 0) or 0) if isinstance(meta, dict) else 0.0
-                    if ts and now_ts - ts > 900:
-                        SIGNAL_META_CACHE.pop(sym, None)
-                        SCORE_CACHE.pop(sym, None)
-                for cache in [SIGNAL_META_CACHE, SCORE_CACHE, ENTRY_LOCKS]:
-                    prune_mapping(cache, max_size=500, prune_count=200)
-            with PROTECTION_LOCK:
-                prune_mapping(PROTECTION_STATE, max_size=500, prune_count=200)
-            with AI_LOCK:
-                AI_PANEL['memory'] = {'score_cache': len(SCORE_CACHE),'signal_meta_cache': len(SIGNAL_META_CACHE),'entry_locks': len(ENTRY_LOCKS),'protection_state': len(PROTECTION_STATE),'fvg_orders': len(FVG_ORDERS)}
-            gc.collect()
-            update_state(ai_panel=dict(AI_PANEL), auto_backtest=dict(AUTO_BACKTEST_STATE))
-        except Exception as e:
-            print('記憶體守護失敗:', e)
-        time.sleep(120)
 
-def enhanced_position_thread():
-    while True:
-        try:
-            with TRAILING_LOCK:
-                for sym, ts in list(TRAILING_STATE.items()):
-                    side = str(ts.get('side', '')).lower()
-                    entry = float(ts.get('entry_price', 0) or 0)
-                    atr = float(ts.get('atr', 0) or 0)
-                    if entry <= 0 or atr <= 0: continue
-                    ticker = exchange.fetch_ticker(sym)
-                    mark = float(ticker.get('last', 0) or 0)
-                    if mark <= 0: continue
-                    params = get_regime_params((AI_PANEL.get('symbol_regimes', {}).get(sym) or {}).get('regime', 'neutral'))
-                    breakeven_atr = float(params.get('breakeven_atr', 0.9))
-                    trail_trigger_atr = float(params.get('trail_trigger_atr', 1.4))
-                    trail_pct = float(params.get('trail_pct', ts.get('trail_pct', 0.035)))
-                    if side in ('buy', 'long'):
-                        profit_atr = (mark - entry) / max(atr, 1e-9)
-                        if profit_atr >= breakeven_atr: ts['initial_sl'] = max(float(ts.get('initial_sl', 0) or 0), entry)
-                        if profit_atr >= trail_trigger_atr: ts['trail_pct'] = min(float(ts.get('trail_pct', trail_pct) or trail_pct), trail_pct)
-                    elif side in ('sell', 'short'):
-                        profit_atr = (entry - mark) / max(atr, 1e-9)
-                        if profit_atr >= breakeven_atr: ts['initial_sl'] = min(float(ts.get('initial_sl', entry * 9) or entry * 9), entry)
-                        if profit_atr >= trail_trigger_atr: ts['trail_pct'] = min(float(ts.get('trail_pct', trail_pct) or trail_pct), trail_pct)
-        except Exception as e:
-            print('強化保本/動態止盈失敗:', e)
-        time.sleep(8)
 
 
 
