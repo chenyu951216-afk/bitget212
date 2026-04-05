@@ -7046,7 +7046,7 @@ def _direction_profile_v6(d15, d4h, d1d):
 
 
 def _ai_adaptive_scoring_profile(symbol='', regime='neutral', setup='', side=0, direction_conf_view=0.0, setup_q=0.0, rr_ratio=0.0):
-    """讓 AI 依實單學習結果自動調整評分權重，但保留原本評分系統結構。"""
+    """AI 自適應評分：只提供最基礎的特徵參考與可學習權重，不再用大量寫死分數公式主導。"""
     try:
         profile = _ai_strategy_profile(symbol, regime=regime, setup=setup)
     except Exception:
@@ -7066,116 +7066,97 @@ def _ai_adaptive_scoring_profile(symbol='', regime='neutral', setup='', side=0, 
     effective_count = float(profile.get('effective_count', profile.get('sample_count', 0.0)) or 0.0)
     fallback_level = str(profile.get('fallback_level') or 'global')
 
+    # 基準權重只保留為「可運作的最小骨架」，真正偏重由學習結果推動。
     adapt = {
-        'w_dir': 6.9,
-        'w_setup': 7.7,
-        'w_rr': 2.7,
-        'w_momentum': 0.95,
-        'w_anti': 0.34,
-        'w_htf': 0.28,
+        'w_dir': 1.0,
+        'w_setup': 1.0,
+        'w_rr': 1.0,
+        'w_momentum': 1.0,
+        'w_anti': 1.0,
+        'w_htf': 1.0,
         'bias': 0.0,
-        'floor': 20.0,
-        'cap': 96.0,
         'quality_adj': float(eq_adj or 0.0),
         'profile': profile,
         'notes': [],
     }
 
-    adapt['w_dir'] += min(max((conf - 0.18) * 2.2, -0.9), 1.2)
-    adapt['w_setup'] += min(max((wr - 50.0) * 0.022, -1.1), 1.3)
-    adapt['w_rr'] += min(max(ev * 8.0, -0.8), 1.0)
-    adapt['w_momentum'] += min(max((pf - 1.0) * 0.18, -0.2), 0.35)
+    learn_power = max(0.18, min(1.0, effective_count / max(float(TREND_AI_FULL_TRADES or 50), 1.0)))
+    conf_edge = max(-0.35, min(0.35, (conf - 0.22) * 1.6))
+    wr_edge = max(-0.40, min(0.40, (wr - 50.0) / 25.0))
+    ev_edge = max(-0.30, min(0.30, ev * 4.0))
+    pf_edge = max(-0.25, min(0.25, (pf - 1.0) * 0.35))
+    dd_edge = max(-0.35, min(0.35, (8.0 - dd) / 18.0)) if dd > 0 else 0.08
 
-    if dd >= 12:
-        adapt['w_anti'] += 0.08
-        adapt['w_htf'] += 0.08
-        adapt['bias'] -= 0.8
-        adapt['notes'].append('高回撤保守')
-    elif dd and dd <= 4:
-        adapt['w_anti'] -= 0.04
-        adapt['w_htf'] -= 0.03
-        adapt['bias'] += 0.4
-        adapt['notes'].append('低回撤放寬')
+    adapt['w_dir'] += (conf_edge * 0.75 + pf_edge * 0.20) * learn_power
+    adapt['w_setup'] += (wr_edge * 0.80 + ev_edge * 0.25 + float(eq_adj or 0.0) * 0.05) * learn_power
+    adapt['w_rr'] += (ev_edge * 0.85 + pf_edge * 0.30) * learn_power
+    adapt['w_momentum'] += (pf_edge * 0.60 + conf_edge * 0.18) * learn_power
+    adapt['w_anti'] += max(-0.22, min(0.40, ((dd - 6.0) / 18.0) + (0.08 if status == 'reject' else -0.04 if status == 'valid' else 0.0))) * learn_power
+    adapt['w_htf'] += max(-0.20, min(0.35, ((dd - 5.0) / 20.0) + (0.06 if fallback_level.startswith('global') else -0.03 if fallback_level.startswith('local') else 0.0))) * learn_power
 
     if phase == 'full':
-        adapt['bias'] += 1.4
-        adapt['w_setup'] += 0.25
-        adapt['w_rr'] += 0.2
+        adapt['bias'] += 0.22
         adapt['notes'].append('AI全接管')
     elif phase == 'semi':
-        adapt['bias'] += 0.55
+        adapt['bias'] += 0.10
         adapt['notes'].append('AI半接管')
     else:
-        adapt['bias'] += 0.15 if effective_count >= 8 else -0.25
+        adapt['bias'] -= 0.04 if effective_count < 8 else 0.0
         adapt['notes'].append('AI學習中')
 
-    if status == 'reject':
-        adapt['bias'] -= 1.8
-        adapt['w_anti'] += 0.12
-        adapt['w_htf'] += 0.10
-        adapt['notes'].append('策略弱勢')
-    elif status == 'valid':
-        adapt['bias'] += 0.8
+    if status == 'valid':
+        adapt['bias'] += 0.12
         adapt['notes'].append('策略有效')
     elif status == 'observe':
-        adapt['bias'] += 0.2
+        adapt['bias'] += 0.03
         adapt['notes'].append('觀察模式')
+    elif status == 'reject':
+        adapt['bias'] -= 0.14
+        adapt['notes'].append('策略弱勢')
 
     if fallback_level.startswith('global'):
-        adapt['w_dir'] -= 0.35
-        adapt['w_setup'] += 0.20
-        adapt['bias'] -= 0.25
+        adapt['bias'] -= 0.05
         adapt['notes'].append('全域回退')
     elif fallback_level.startswith('mid'):
-        adapt['bias'] += 0.1
         adapt['notes'].append('中層回退')
     else:
-        adapt['w_dir'] += 0.15
-        adapt['bias'] += 0.25
+        adapt['bias'] += 0.03
         adapt['notes'].append('局部接管')
 
-    if rr_ratio >= 2.2:
-        adapt['w_rr'] += 0.25
-    elif rr_ratio < 1.25:
-        adapt['w_rr'] -= 0.25
-        adapt['bias'] -= 0.45
-
-    if float(setup_q or 0.0) >= 6.5:
-        adapt['w_setup'] += 0.25
-    elif float(setup_q or 0.0) < 3.0:
-        adapt['w_setup'] -= 0.20
+    if rr_ratio >= 2.0:
+        adapt['w_rr'] += 0.05 * learn_power
+    elif rr_ratio < 1.2:
+        adapt['w_rr'] -= 0.08 * learn_power
+        adapt['bias'] -= 0.05
 
     if eq_note:
         adapt['notes'].append(eq_note)
 
     for k in ('w_dir', 'w_setup', 'w_rr', 'w_momentum', 'w_anti', 'w_htf'):
-        adapt[k] = round(float(adapt[k]), 4)
-    adapt['bias'] = round(float(adapt['bias']), 4)
+        adapt[k] = round(max(0.55, min(1.85, float(adapt[k]))), 4)
+    adapt['bias'] = round(max(-0.35, min(0.35, float(adapt['bias']))), 4)
     return adapt
 
 
 def _grade_signal_v6(direction_conf, setup_q, rr, anti_chase_penalty, htf_penalty):
-    """統一等級判定：更貼近實際可交易性，避免被懲罰項過度壓成整排 C。"""
+    """等級只做最基礎顯示，主體評分由 AI 最終分數控制。"""
     dc = max(0.0, min(float(direction_conf or 0.0), 10.0))
     sq = max(0.0, min(float(setup_q or 0.0), 10.0))
-    rrv = max(0.0, min(float(rr or 0.0), 3.2))
-    anti = max(0.0, float(anti_chase_penalty or 0.0))
-    htf = max(0.0, float(htf_penalty or 0.0))
-
-    rr_bonus = max(min((rrv - 1.1) * 5.6, 8.5), -2.5)
-    tradability = sq * 7.4 + dc * 4.9 + rr_bonus
-    penalty = anti * 0.22 + htf * 0.18
-    composite = tradability - penalty
-
-    if sq >= 7.0 and rrv >= 2.0 and dc >= 4.6 and composite >= 66:
+    rrv = max(0.0, min(float(rr or 0.0), 3.5))
+    anti = max(0.0, min(float(anti_chase_penalty or 0.0), 12.0))
+    htf = max(0.0, min(float(htf_penalty or 0.0), 12.0))
+    base = dc * 0.34 + sq * 0.40 + min(rrv / 2.0, 1.25) * 0.26
+    penalty = anti * 0.015 + htf * 0.012
+    composite = max(0.0, min(1.15, base - penalty))
+    if composite >= 0.88:
         return 'A+'
-    if sq >= 5.9 and rrv >= 1.7 and dc >= 3.5 and composite >= 55:
+    if composite >= 0.76:
         return 'A'
-    if sq >= 4.8 and rrv >= 1.45 and dc >= 2.6 and composite >= 45:
+    if composite >= 0.63:
         return 'B+'
-    if sq >= 3.6 and rrv >= 1.2 and composite >= 35:
+    if composite >= 0.50:
         return 'B'
-    if sq >= 2.2 and rrv >= 1.0 and composite >= 24:
+    if composite >= 0.34:
         return 'C'
     return 'D'
 
@@ -7318,42 +7299,52 @@ def analyze_legacy_shadow_2(symbol):
         except Exception:
             pass
 
-        rr_bonus = max(min((rr_ratio - 1.2) * 6.2, 8.0), -3.5)
-        momentum_bonus = max(min(helper * 1.05, 9.0), -7.0)
+        rr_feat = max(0.0, min(1.25, (rr_ratio - 1.0) / 1.35))
+        dir_feat = max(0.0, min(1.0, direction_conf_view / 10.0))
+        setup_feat = max(0.0, min(1.0, setup_q / 10.0))
+        momentum_feat = max(0.0, min(1.0, (helper + 10.0) / 20.0))
+        anti_feat = max(0.0, min(1.0, anti_chase_penalty / 12.0))
+        htf_feat = max(0.0, min(1.0, htf_penalty / 12.0))
         ai_adapt = _ai_adaptive_scoring_profile(symbol, regime=current_regime, setup=setup_label, side=side, direction_conf_view=direction_conf_view, setup_q=setup_q, rr_ratio=rr_ratio)
-        penalty_soft = anti_chase_penalty * float(ai_adapt.get('w_anti', 0.34) or 0.34) + htf_penalty * float(ai_adapt.get('w_htf', 0.28) or 0.28)
-        raw = (
-            direction_conf_view * float(ai_adapt.get('w_dir', 6.9) or 6.9)
-            + setup_q * float(ai_adapt.get('w_setup', 7.7) or 7.7)
-            + rr_bonus * float(ai_adapt.get('w_rr', 2.7) or 2.7)
-            + momentum_bonus * float(ai_adapt.get('w_momentum', 0.95) or 0.95)
-            + float(ai_adapt.get('quality_adj', 0.0) or 0.0)
-            + float(ai_adapt.get('bias', 0.0) or 0.0)
-            - penalty_soft
+        pos_score = (
+            dir_feat * float(ai_adapt.get('w_dir', 1.0) or 1.0)
+            + setup_feat * float(ai_adapt.get('w_setup', 1.0) or 1.0)
+            + rr_feat * float(ai_adapt.get('w_rr', 1.0) or 1.0)
+            + momentum_feat * float(ai_adapt.get('w_momentum', 1.0) or 1.0)
         )
+        neg_score = (
+            anti_feat * float(ai_adapt.get('w_anti', 1.0) or 1.0)
+            + htf_feat * float(ai_adapt.get('w_htf', 1.0) or 1.0)
+        )
+        denom = max(
+            float(ai_adapt.get('w_dir', 1.0) or 1.0)
+            + float(ai_adapt.get('w_setup', 1.0) or 1.0)
+            + float(ai_adapt.get('w_rr', 1.0) or 1.0)
+            + float(ai_adapt.get('w_momentum', 1.0) or 1.0)
+            + float(ai_adapt.get('w_anti', 1.0) or 1.0)
+            + float(ai_adapt.get('w_htf', 1.0) or 1.0),
+            1e-9,
+        )
+        net_strength = (pos_score - neg_score) / denom
         if direction_strong:
-            raw += 2.0
-        else:
-            raw -= 0.9
-        floor_v = float(ai_adapt.get('floor', 20.0) or 20.0)
-        cap_v = float(ai_adapt.get('cap', 96.0) or 96.0)
-        score_abs = _clip(raw, floor_v, cap_v)
-        if score_abs < 48:
-            score_abs = 48 - (48 - score_abs) * 0.48
+            net_strength += 0.035
+        net_strength += float(ai_adapt.get('bias', 0.0) or 0.0)
+        score_abs = round(max(0.0, min(100.0, 50.0 + net_strength * 58.0)), 1)
         score = round(score_abs if side > 0 else -score_abs, 1)
 
         sl_mult = round(abs(entry - sl) / max(atr15, 1e-9), 2)
         tp_mult = round(abs(tp - entry) / max(atr15, 1e-9), 2)
         est_pnl = round(abs(tp - entry) / max(entry, 1e-9) * 100 * 20, 2)
-        direction_for_grade = max(direction_conf_view, min(9.9, direction_conf_view + float(ai_adapt.get('bias', 0.0) or 0.0) * 0.35))
-        grade = _grade_signal_v6(direction_for_grade, setup_q + max(min(float(ai_adapt.get('quality_adj', 0.0) or 0.0) * 0.25, 0.8), -0.8), rr_ratio, anti_chase_penalty * float(ai_adapt.get('w_anti', 0.34) or 0.34), htf_penalty * float(ai_adapt.get('w_htf', 0.28) or 0.28))
+        entry_quality = round(max(1.0, min(10.0, (setup_feat * 6.2 + dir_feat * 2.1 + rr_feat * 1.4 - anti_feat * 0.7 - htf_feat * 0.6) * 1.55 + float(ai_adapt.get('quality_adj', 0.0) or 0.0) * 0.15)), 1)
+        direction_for_grade = max(direction_conf_view, min(9.9, direction_conf_view + float(ai_adapt.get('bias', 0.0) or 0.0) * 2.0))
+        grade = _grade_signal_v6(direction_for_grade, entry_quality, rr_ratio, anti_chase_penalty, htf_penalty)
 
-        breakdown['進場品質'] = round(setup_q + max(min(float(ai_adapt.get('quality_adj', 0.0) or 0.0) * 0.2, 0.6), -0.6), 1)
+        breakdown['進場品質'] = entry_quality
         breakdown['RR'] = round(rr_ratio, 2)
         breakdown['Setup'] = setup_label
-        trend_conf_val = round(max(0.0, min(direction_conf_view * (8.2 + max(float(ai_adapt.get('w_dir', 6.9) or 6.9) - 6.9, -0.8)) + setup_q * (4.9 + max(float(ai_adapt.get('w_setup', 7.7) or 7.7) - 7.7, -0.8)) + rr_bonus * (1.8 + max(float(ai_adapt.get('w_rr', 2.7) or 2.7) - 2.7, -0.5)) - anti_chase_penalty * (0.52 + max(float(ai_adapt.get('w_anti', 0.34) or 0.34) - 0.34, -0.08)) - htf_penalty * (0.48 + max(float(ai_adapt.get('w_htf', 0.28) or 0.28) - 0.28, -0.08)) + float(ai_adapt.get('bias', 0.0) or 0.0) * 1.6, 99.0)), 1)
-        regime_conf_val = round(max(0.0, min(direction_conf_view * (6.8 + max(float(ai_adapt.get('w_dir', 6.9) or 6.9) - 6.9, -0.8) * 0.6) + max(helper, -6) * (1.18 + max(float(ai_adapt.get('w_momentum', 0.95) or 0.95) - 0.95, -0.2)) + rr_bonus * (1.25 + max(float(ai_adapt.get('w_rr', 2.7) or 2.7) - 2.7, -0.4)) - htf_penalty * (0.34 + max(float(ai_adapt.get('w_htf', 0.28) or 0.28) - 0.28, -0.08)) + float(ai_adapt.get('bias', 0.0) or 0.0) * 1.2, 99.0)), 1)
-        direction_display = max(direction_conf_view * 0.54 + trend_conf_val / 18.5 + regime_conf_val / 22.0, trend_conf_val / 10.6, regime_conf_val / 11.8)
+        trend_conf_val = round(max(0.0, min(99.0, (dir_feat * float(ai_adapt.get('w_dir', 1.0) or 1.0) + setup_feat * float(ai_adapt.get('w_setup', 1.0) or 1.0) + rr_feat * float(ai_adapt.get('w_rr', 1.0) or 1.0) - anti_feat * float(ai_adapt.get('w_anti', 1.0) or 1.0) * 0.6 - htf_feat * float(ai_adapt.get('w_htf', 1.0) or 1.0) * 0.45) / max((float(ai_adapt.get('w_dir', 1.0) or 1.0) + float(ai_adapt.get('w_setup', 1.0) or 1.0) + float(ai_adapt.get('w_rr', 1.0) or 1.0) + float(ai_adapt.get('w_anti', 1.0) or 1.0) * 0.6 + float(ai_adapt.get('w_htf', 1.0) or 1.0) * 0.45), 1e-9) * 100.0)), 1)
+        regime_conf_val = round(max(0.0, min(99.0, (dir_feat * 0.65 + momentum_feat * 0.22 + rr_feat * 0.18 - htf_feat * 0.14 - anti_feat * 0.12 + float(ai_adapt.get('bias', 0.0) or 0.0) * 0.2) * 100.0)), 1)
+        direction_display = round(max(direction_conf_view, trend_conf_val / 10.0, regime_conf_val / 10.5), 1)
         breakdown['方向信心'] = round(max(direction_display, 0.0), 1)
         breakdown['TrendConfidence'] = trend_conf_val
         breakdown['RegimeConfidence'] = regime_conf_val
@@ -7364,12 +7355,12 @@ def analyze_legacy_shadow_2(symbol):
         breakdown['輔助因子'] = helper if side > 0 else -helper
         breakdown['AI評分模式'] = '|'.join((ai_adapt.get('notes') or [])[:4])
         breakdown['AI權重'] = {
-            'dir': round(float(ai_adapt.get('w_dir', 0) or 0), 2),
-            'setup': round(float(ai_adapt.get('w_setup', 0) or 0), 2),
-            'rr': round(float(ai_adapt.get('w_rr', 0) or 0), 2),
-            'mom': round(float(ai_adapt.get('w_momentum', 0) or 0), 2),
-            'anti': round(float(ai_adapt.get('w_anti', 0) or 0), 2),
-            'htf': round(float(ai_adapt.get('w_htf', 0) or 0), 2),
+            'dir': round(float(ai_adapt.get('w_dir', 1.0) or 1.0), 2),
+            'setup': round(float(ai_adapt.get('w_setup', 1.0) or 1.0), 2),
+            'rr': round(float(ai_adapt.get('w_rr', 1.0) or 1.0), 2),
+            'mom': round(float(ai_adapt.get('w_momentum', 1.0) or 1.0), 2),
+            'anti': round(float(ai_adapt.get('w_anti', 1.0) or 1.0), 2),
+            'htf': round(float(ai_adapt.get('w_htf', 1.0) or 1.0), 2),
             'bias': round(float(ai_adapt.get('bias', 0) or 0), 2),
         }
 
