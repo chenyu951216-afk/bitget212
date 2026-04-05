@@ -95,8 +95,9 @@ STRATEGY_CAPITAL_MIN_TRADES = DATASET_POLICY['strategy_capital_min_trades']  # �
 STRATEGY_BLOCK_MIN_TRADES = max(int(DATASET_POLICY.get('strategy_block_min_trades', 11) or 11), 20)   # AI主控版：延後策略封鎖啟用
 STRATEGY_BLOCK_MIN_WINRATE = min(float(DATASET_POLICY.get('strategy_block_min_winrate', 45) or 45), 40.0)# AI主控版：放寬策略封鎖勝率
 NEUTRAL_REGIME_BLOCK = False      # AI主控版：neutral 允許低倉位交易
-LEARNING_DATASET_META = build_learning_dataset_meta(reset_from=env_or_blank('TREND_LEARNING_RESET_FROM', ''))
-TREND_LEARNING_RESET_FROM = LEARNING_DATASET_META.get('activated_from', '') or None  # 舊資料先納入，待新版實單累積足夠後再切換
+DATASET_RESET_TW = "2026-04-05 13:45:00"  # 台灣時間，這個時間之後才算新版 AI 主控資料
+LEARNING_DATASET_META = build_learning_dataset_meta(reset_from=env_or_blank('TREND_LEARNING_RESET_FROM', DATASET_RESET_TW))
+TREND_LEARNING_RESET_FROM = LEARNING_DATASET_META.get('activated_from', '') or DATASET_RESET_TW
 LEGACY_BOOTSTRAP_MIN_NEW_TRADES = max(int(TREND_AI_FULL_TRADES or 50), 50)
 TREND_EARLY_EXIT_MIN_RUN = 1.20 # 平倉後若後續延續超過此幅度，視為可能太早出場
 TREND_EARLY_EXIT_MIN_EDGE = 0.35# 平倉後先回踩不超過這個比例，才算健康回踩後延續
@@ -134,7 +135,13 @@ RUNTIME_STATE.update(meta=get_policy_snapshot())
 
 
 def _dataset_meta():
-    return dict(LEARNING_DATASET_META or {})
+    meta = dict(LEARNING_DATASET_META or {})
+    meta.setdefault('activated_from', TREND_LEARNING_RESET_FROM)
+    meta.setdefault('reset_from', TREND_LEARNING_RESET_FROM)
+    meta.setdefault('reset_timezone', 'Asia/Taipei')
+    meta.setdefault('dataset_mode', 'layered_live_only')
+    meta.setdefault('legacy_policy', 'bootstrap_then_fade_out')
+    return meta
 
 
 def _execution_quality_state(sig):
@@ -1416,6 +1423,7 @@ def get_live_trades(closed_only=False, pool='all'):
         trades = [enrich_learning_trade(dict(t or {}), reset_from=TREND_LEARNING_RESET_FROM) for t in list(LEARN_DB.get("trades", []) or [])]
     rows = [t for t in trades if _is_live_source(t.get("source"))]
     rows = filter_learning_pool(rows, pool=pool, closed_only=closed_only, reset_from=TREND_LEARNING_RESET_FROM)
+    rows = _tag_dataset_layers(rows)
     return rows
 
 def _parse_trade_time(trade):
@@ -1446,6 +1454,32 @@ def _legacy_new_split(rows):
         else:
             legacy_rows.append(t)
     return new_rows, legacy_rows
+
+def _tag_dataset_layers(rows):
+    tagged = [dict(t or {}) for t in list(rows or [])]
+    new_rows, legacy_rows = _legacy_new_split(tagged)
+    new_ids = {str(t.get('id') or t.get('trade_id') or '') for t in new_rows}
+    legacy_ids = {str(t.get('id') or t.get('trade_id') or '') for t in legacy_rows}
+    out = []
+    for t in tagged:
+        tid = str(t.get('id') or t.get('trade_id') or '')
+        layer = 'legacy'
+        if tid and tid in new_ids:
+            layer = 'new'
+        elif tid and tid in legacy_ids:
+            layer = 'legacy'
+        else:
+            trade_dt = _parse_trade_time(t)
+            try:
+                reset_dt = datetime.strptime(str(TREND_LEARNING_RESET_FROM or ''), "%Y-%m-%d %H:%M:%S")
+                if trade_dt and trade_dt >= reset_dt:
+                    layer = 'new'
+            except Exception:
+                pass
+        t['dataset_layer'] = layer
+        t['dataset_reset_from'] = TREND_LEARNING_RESET_FROM
+        out.append(t)
+    return out
 
 def _legacy_trade_quality(trade):
     metric = float(_trade_learn_metric(trade) or 0.0)
@@ -1508,12 +1542,19 @@ def _filter_legacy_bootstrap_rows(legacy_rows, new_rows=None):
 def get_trend_live_trades(closed_only=False):
     rows = get_live_trades(closed_only=closed_only)
     new_rows, legacy_rows = _legacy_new_split(rows)
+    try:
+        LEARNING_DATASET_META['trend_new_count'] = len(new_rows)
+        LEARNING_DATASET_META['trend_legacy_count'] = len(legacy_rows)
+        LEARNING_DATASET_META['trend_reset_from'] = TREND_LEARNING_RESET_FROM
+    except Exception:
+        pass
     if not legacy_rows:
         return new_rows or rows
     if len(new_rows) >= LEGACY_BOOTSTRAP_MIN_NEW_TRADES:
         return new_rows
     legacy_filtered = _filter_legacy_bootstrap_rows(legacy_rows, new_rows=new_rows)
     merged = list(new_rows) + list(legacy_filtered)
+    merged = _tag_dataset_layers(merged)
     return merged if merged else rows
 
 def _trade_learn_metric(trade):
@@ -6128,6 +6169,8 @@ def place_order(sig):
                    }),
                    "result":"open","post_candles":[],"missed_move_pct":None,"post_run_pct":0.0,"post_pullback_pct":0.0,"trend_continuation":False,"trend_reason":"","source":"live_bitget_v32"}
         learn_rec.update(_dataset_meta())
+        learn_rec['dataset_layer'] = 'new'
+        learn_rec['dataset_reset_from'] = TREND_LEARNING_RESET_FROM
         learn_rec = enrich_learning_trade(learn_rec, reset_from=TREND_LEARNING_RESET_FROM)
         with LEARN_LOCK:
             LEARN_DB["trades"].append(learn_rec)
