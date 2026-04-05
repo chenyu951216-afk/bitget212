@@ -1830,6 +1830,148 @@ def _regime_setup_fit(regime='neutral', setup=''):
         return False, '趨勢/中性盤不優先做區間逆勢'
     return True, '市場與策略相容'
 
+
+def _normalize_market_state(state='neutral'):
+    s = str(state or 'neutral').strip().lower()
+    mapping = {
+        'trend_pullback': 'trend_pullback',
+        'pullback': 'trend_pullback',
+        'trend_continuation': 'trend_continuation',
+        'trend': 'trend_continuation',
+        'range': 'range_rotation',
+        'range_rotation': 'range_rotation',
+        'breakout': 'breakout_ready',
+        'breakout_ready': 'breakout_ready',
+        'squeeze': 'squeeze_ready',
+        'squeeze_ready': 'squeeze_ready',
+        'fake_breakout': 'fake_breakout_reversal',
+        'fake_breakout_reversal': 'fake_breakout_reversal',
+        'reversal': 'fake_breakout_reversal',
+        'news': 'news_expansion',
+        'news_expansion': 'news_expansion',
+        'neutral': 'neutral_transition',
+        'neutral_transition': 'neutral_transition',
+    }
+    return mapping.get(s, s or 'neutral_transition')
+
+
+def _classify_market_atlas(regime='neutral', setup='', breakdown=None, desc=''):
+    bd = dict(breakdown or {})
+    regime = str(regime or bd.get('Regime') or 'neutral')
+    setup_text = str(setup or bd.get('Setup') or '')
+    desc_text = str(desc or '')
+    pre_s = float(bd.get('蓄勢結構', 0) or 0)
+    bo_s = float(bd.get('突破預判', 0) or 0)
+    fvg_rt = float(bd.get('FVG回踩品質', 0) or 0)
+    fake_s = float(bd.get('假突破濾網', 0) or 0)
+    liq_s = float(bd.get('流動性掃單', 0) or 0)
+    entry_q = float(bd.get('進場品質', 0) or 0)
+    reg_conf = float(bd.get('RegimeConf', 0) or 0)
+    state = 'neutral_transition'
+    confidence = 0.38 + min(abs(entry_q) / 18.0, 0.12)
+    note = '中性過渡'
+
+    if fake_s <= -3 or '假突破' in desc_text or '掃流動性反轉' in setup_text:
+        state = 'fake_breakout_reversal'
+        confidence = 0.68 + min(abs(fake_s) / 10.0, 0.22)
+        note = '假突破/掃流動性後反轉'
+    elif regime in ('news', 'breakout') and (bo_s >= 2 or pre_s >= 2):
+        state = 'news_expansion' if regime == 'news' else 'breakout_ready'
+        confidence = 0.66 + min((abs(bo_s) + abs(pre_s)) / 14.0, 0.24)
+        note = '消息/爆發擴張結構'
+    elif pre_s >= 3 and bo_s >= 2:
+        state = 'squeeze_ready'
+        confidence = 0.64 + min((pre_s + bo_s) / 16.0, 0.22)
+        note = '收斂後準備突破'
+    elif fvg_rt >= 2 or ('回踩' in setup_text and regime in ('trend', 'neutral')):
+        state = 'trend_pullback'
+        confidence = 0.60 + min(abs(fvg_rt) / 12.0, 0.22)
+        note = '趨勢回踩/反彈承接'
+    elif regime == 'range' or ('區間' in setup_text and abs(liq_s) <= 2):
+        state = 'range_rotation'
+        confidence = 0.58 + min(abs(entry_q) / 16.0, 0.18)
+        note = '區間來回輪動'
+    elif regime == 'trend' or ('延續' in setup_text) or abs(liq_s) >= 3:
+        state = 'trend_continuation'
+        confidence = 0.60 + min((abs(liq_s) + abs(entry_q)) / 18.0, 0.22)
+        note = '趨勢延續/順勢加速'
+    confidence = max(0.35, min(confidence + min(reg_conf * 0.12, 0.08), 0.95))
+    return _normalize_market_state(state), round(confidence, 3), note
+
+
+def _market_state_from_trade(trade):
+    bd = dict((trade or {}).get('breakdown') or {})
+    state = str(bd.get('MarketState') or '')
+    if state:
+        return _normalize_market_state(state)
+    regime = str(bd.get('Regime', 'neutral') or 'neutral')
+    setup = str((trade or {}).get('setup_label') or bd.get('Setup') or '')
+    desc = str((trade or {}).get('desc') or '')
+    state, _, _ = _classify_market_atlas(regime=regime, setup=setup, breakdown=bd, desc=desc)
+    return state
+
+
+def _market_state_profile(symbol='', regime='neutral', setup='', market_state=''):
+    rows = get_trend_live_trades(closed_only=True)
+    wanted = _normalize_market_state(market_state or 'neutral_transition')
+    symbol = str(symbol or '')
+    regime = str(regime or 'neutral')
+    setup_mode = _normalize_setup_mode(setup)
+    state_rows = []
+    symbol_state_rows = []
+    regime_state_rows = []
+    for t in rows:
+        bd = dict(t.get('breakdown') or {})
+        t_state = _market_state_from_trade(t)
+        if t_state != wanted:
+            continue
+        state_rows.append(t)
+        if symbol and str(t.get('symbol') or '') == symbol:
+            symbol_state_rows.append(t)
+        if str(bd.get('Regime', 'neutral') or 'neutral') == regime:
+            regime_state_rows.append(t)
+    picked = []
+    source = 'none'
+    if len(symbol_state_rows) >= 5:
+        picked = symbol_state_rows
+        source = 'symbol_state'
+    elif len(regime_state_rows) >= 7:
+        picked = regime_state_rows
+        source = 'regime_state'
+    elif len(state_rows) >= 9:
+        picked = state_rows
+        source = 'market_state'
+    if not picked:
+        return {
+            'market_state': wanted, 'count': 0, 'win_rate': 50.0, 'avg_pnl': 0.0,
+            'confidence': 0.0, 'source': source, 'boost': 0.0,
+            'note': f'市場狀態樣本不足:{wanted}'
+        }
+    count = len(picked)
+    wins = sum(1 for t in picked if t.get('result') == 'win')
+    win_rate = wins / max(count, 1) * 100.0
+    avg_pnl = sum(_trade_learn_metric(t) for t in picked) / max(count, 1)
+    confidence = min(0.95, 0.35 + count / 24.0)
+    boost = (win_rate - 50.0) * 0.025 + avg_pnl * 10.0
+    if setup_mode:
+        matched_setup = [t for t in picked if _normalize_setup_mode((t.get('setup_label') or (t.get('breakdown') or {}).get('Setup') or '')) == setup_mode]
+        if len(matched_setup) >= 4:
+            count2 = len(matched_setup)
+            wins2 = sum(1 for t in matched_setup if t.get('result') == 'win')
+            win_rate2 = wins2 / max(count2, 1) * 100.0
+            avg_pnl2 = sum(_trade_learn_metric(t) for t in matched_setup) / max(count2, 1)
+            win_rate = (win_rate * 0.45) + (win_rate2 * 0.55)
+            avg_pnl = (avg_pnl * 0.45) + (avg_pnl2 * 0.55)
+            boost += (win_rate2 - 50.0) * 0.01 + avg_pnl2 * 4.0
+            source += '+setup'
+    return {
+        'market_state': wanted, 'count': count, 'win_rate': round(win_rate, 2), 'avg_pnl': round(avg_pnl, 4),
+        'confidence': round(confidence, 3), 'source': source,
+        'boost': round(max(min(boost, 4.5), -4.5), 3),
+        'note': f'市場學習:{wanted}|{source}|樣本{count}|勝率{win_rate:.1f}%|均利{avg_pnl:+.3f}'
+    }
+
+
 def _symbol_hard_block(symbol=''):
     rows = [t for t in get_live_trades(closed_only=True) if str(t.get('symbol')) == str(symbol)]
     cnt = len(rows)
@@ -2094,6 +2236,8 @@ def _rebuild_live_learning_db(db):
         "trades": live_trades,
         "pattern_stats": {},
         "symbol_stats": {},
+        "market_state_stats": {},
+        "symbol_market_state_stats": {},
         "atr_params": dict((db.get("atr_params") or {"default_sl": 2.0, "default_tp": 3.5})),
         "total_trades": 0,
         "win_rate": 0.0,
@@ -2147,6 +2291,25 @@ def _rebuild_live_learning_db(db):
                 ss["win"] += 1
             else:
                 ss["loss"] += 1
+
+        bd = dict(trade.get("breakdown") or {})
+        market_state = str(bd.get("MarketState") or bd.get("Setup") or bd.get("Regime") or "neutral")
+        ms = rebuilt["market_state_stats"].setdefault(market_state, {"count": 0, "win": 0, "loss": 0, "pnl_sum": 0.0})
+        ms["count"] += 1
+        ms["pnl_sum"] += metric
+        if trade.get("result") == "win":
+            ms["win"] += 1
+        else:
+            ms["loss"] += 1
+        if sym:
+            smk = f"{sym}|{market_state}"
+            sms = rebuilt["symbol_market_state_stats"].setdefault(smk, {"count": 0, "win": 0, "loss": 0, "pnl_sum": 0.0})
+            sms["count"] += 1
+            sms["pnl_sum"] += metric
+            if trade.get("result") == "win":
+                sms["win"] += 1
+            else:
+                sms["loss"] += 1
 
     if live_closed:
         rebuilt["total_trades"] = len(live_closed)
@@ -2837,6 +3000,8 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     regime = str(bd.get('Regime', 'neutral') or 'neutral')
     setup = str(sig.get('setup_label') or bd.get('Setup', '') or '')
     profile = _ai_strategy_profile(symbol, regime=regime, setup=setup)
+    market_state, market_state_conf, market_state_note = _classify_market_atlas(regime=regime, setup=setup, breakdown=bd, desc=str(sig.get('desc') or ''))
+    market_profile = _market_state_profile(symbol=symbol, regime=regime, setup=setup, market_state=market_state)
 
     global_live_count = len(get_trend_live_trades(closed_only=True))
     if global_live_count < TREND_AI_SEMI_TRADES:
@@ -2857,6 +3022,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         ai_cov = float(bd.get('AIScoreCoverage', 0) or 0)
         ai_scnt = int(bd.get('AISampleCount', 0) or 0)
         ai_threshold = float(base_threshold) + float(profile.get('threshold_adjust', 0) or 0)
+        ai_threshold -= float(market_profile.get('boost', 0.0) or 0.0) * 0.18
         if phase == 'learning':
             ai_threshold -= 5.0
         elif phase == 'full':
@@ -2869,6 +3035,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         ai_score_adj += (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.06
         ai_score_adj += eq_adj
         ai_score_adj += ai_cov * 6.0
+        ai_score_adj += float(market_profile.get('boost', 0.0) or 0.0) * (0.9 + market_state_conf * 0.35)
         ai_score_adj += min(ai_scnt / 18.0, 3.0)
         if not fit_ok:
             ai_score_adj -= 1.25
@@ -2907,6 +3074,9 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         reasons.append(f'全域樣本 {global_live_count}')
         reasons.append(f'AI覆蓋率 {ai_cov:.2f}')
         reasons.append(f'AI特徵樣本 {ai_scnt}')
+        reasons.append(f'市場狀態 {market_state} conf {market_state_conf:.2f}')
+        if market_profile.get('note'):
+            reasons.append(str(market_profile.get('note')))
         if rotation_notes:
             reasons.extend(rotation_notes)
         if bool(profile.get('symbol_blocked')):
@@ -2944,7 +3114,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             effective_score=effective_score,
             effective_threshold=ai_threshold,
             decision_calibrator=decision_calibrator,
-            signal_snapshot={'score': score, 'threshold_raw': base_threshold, 'threshold_calibrated': ai_threshold, 'execution_quality': execution_snapshot},
+            signal_snapshot={'score': score, 'threshold_raw': base_threshold, 'threshold_calibrated': ai_threshold, 'execution_quality': execution_snapshot, 'market_state': market_state},
         )
         return {
             'allow_now': bool(base_ok and ai_ok),
@@ -2952,7 +3122,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             'effective_score': round(effective_score, 2),
             'rotation_adj': round(rotation_adj, 2),
             'reasons': list(dict.fromkeys(reasons)),
-            'profile': dict(profile, phase=phase),
+            'profile': dict(profile, phase=phase, market_state=market_state, market_profile=market_profile),
             'gating': gating,
             'decision_calibrator': decision_calibrator,
             'decision_explain': merge_decision_explain(gating=gating, calibrator=decision_calibrator, profile=dict(profile, phase=phase), reasons=reasons),
@@ -3004,6 +3174,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     rotation_adj, rotation_notes = _symbol_rotation_adjustment(symbol)
     eq_adj, eq_note = _entry_quality_feedback(symbol, regime, setup, eq)
     ai_score_adj = float(profile.get('ev_per_trade', 0) or 0) * 20.0
+    ai_score_adj += float(market_profile.get('boost', 0.0) or 0.0) * (0.8 + market_state_conf * 0.3)
     ai_score_adj += (float(profile.get('win_rate', 0) or 0) - 50.0) * 0.04
     ai_score_adj += eq_adj
     execution_snapshot = _execution_quality_state(sig)
@@ -3080,6 +3251,9 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         if profile.get('note'):
             reasons.append(str(profile.get('note')))
 
+    reasons.append(f'市場狀態 {market_state} conf {market_state_conf:.2f}')
+    if market_profile.get('note'):
+        reasons.append(str(market_profile.get('note')))
     if eq_note:
         reasons.append(eq_note)
     reasons.append('AI分數調整 {:+.2f}'.format(ai_score_adj))
@@ -3105,7 +3279,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         effective_score=effective_score,
         effective_threshold=ai_threshold,
         decision_calibrator=decision_calibrator,
-        signal_snapshot={'score': score, 'threshold_raw': base_threshold, 'threshold_calibrated': ai_threshold, 'execution_quality': execution_snapshot},
+        signal_snapshot={'score': score, 'threshold_raw': base_threshold, 'threshold_calibrated': ai_threshold, 'execution_quality': execution_snapshot, 'market_state': market_state},
     )
     return {
         'allow_now': bool(base_ok and ai_ok),
@@ -3113,7 +3287,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         'effective_score': round(effective_score, 2),
         'rotation_adj': round(rotation_adj, 2),
         'reasons': list(dict.fromkeys(reasons)),
-        'profile': dict(profile, phase=phase),
+        'profile': dict(profile, phase=phase, market_state=market_state, market_profile=market_profile),
         'gating': gating,
         'decision_calibrator': decision_calibrator,
         'decision_explain': merge_decision_explain(gating=gating, calibrator=decision_calibrator, profile=dict(profile, phase=phase), reasons=reasons),
@@ -5389,6 +5563,27 @@ def learn_from_closed_trade_legacy_shadow_1(trade_id):
                 srs[rk]['win'] += 1
             else:
                 srs[rk]['loss'] += 1
+
+            market_state = _market_state_from_trade(trade)
+            mss = db.setdefault('market_state_stats', {})
+            ms = mss.setdefault(market_state, {'count': 0, 'win': 0, 'loss': 0, 'pnl_sum': 0.0, 'last_update': '--'})
+            ms['count'] += 1
+            ms['pnl_sum'] += metric
+            ms['last_update'] = tw_now_str('%Y-%m-%d %H:%M:%S')
+            if result == 'win':
+                ms['win'] += 1
+            else:
+                ms['loss'] += 1
+            smss = db.setdefault('symbol_market_state_stats', {})
+            smk = f"{sym}|{market_state}"
+            sms = smss.setdefault(smk, {'count': 0, 'win': 0, 'loss': 0, 'pnl_sum': 0.0, 'last_update': '--'})
+            sms['count'] += 1
+            sms['pnl_sum'] += metric
+            sms['last_update'] = tw_now_str('%Y-%m-%d %H:%M:%S')
+            if result == 'win':
+                sms['win'] += 1
+            else:
+                sms['loss'] += 1
 
             save_learn_db(db)
 
@@ -7758,6 +7953,8 @@ def _default_ai_db():
     return {
         "regime_stats": {},
         "symbol_regime_stats": {},
+        "market_state_stats": {},
+        "symbol_market_state_stats": {},
         "indicator_weights": {},
         "ai_feature_model": {"features": {}, "meta": {"samples": 0, "wins": 0, "avg_pnl": 0.0, "updated_at": "--"}},
         "combo_stats": {},
@@ -8650,7 +8847,11 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
         extra=extra,
     )
     final_score = round(float(ai_score_payload.get('score', score + score_boost) or 0.0), 1)
+    market_state, market_state_conf, market_state_note = _classify_market_atlas(regime=regime, setup=str(breakdown.get('Setup') or ''), breakdown=breakdown, desc=desc)
     breakdown['Regime'] = regime
+    breakdown['MarketState'] = market_state
+    breakdown['MarketStateConf'] = round(market_state_conf, 3)
+    breakdown['MarketStateNote'] = market_state_note
     breakdown['RegimeConf'] = round(conf, 3)
     breakdown['RegimeDir'] = direction
     breakdown['RegimeScoreAdj'] = round(score_boost, 2)
@@ -8673,6 +8874,7 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
         breakdown['AITopFeature'] = str(top_ai[0].get('feature') or '')
 
     desc = (desc + '|' if desc else '') + '市場:{}({}/{:.0%}/{})'.format(regime, direction, conf, tempo)
+    desc += '|型態:{}({:.0%})'.format(market_state, market_state_conf)
     if extra:
         desc += '|' + '|'.join(dict.fromkeys(extra))
 
@@ -8731,11 +8933,13 @@ def _enhanced_auto_learn():
     combo_stats = db.setdefault('combo_stats', {})
     regime_stats = db.setdefault('regime_stats', {})
     symbol_regime_stats = db.setdefault('symbol_regime_stats', {})
+    market_state_stats = db.setdefault('market_state_stats', {})
+    symbol_market_state_stats = db.setdefault('symbol_market_state_stats', {})
     entry_quality_feedback = db.setdefault('entry_quality_feedback', {})
     blocked_strategy_keys = set(db.setdefault('blocked_strategy_keys', []))
     blocked_symbols = set(db.setdefault('blocked_symbols', []))
 
-    combo_stats.clear(); regime_stats.clear(); symbol_regime_stats.clear(); entry_quality_feedback.clear()
+    combo_stats.clear(); regime_stats.clear(); symbol_regime_stats.clear(); market_state_stats.clear(); symbol_market_state_stats.clear(); entry_quality_feedback.clear()
 
     recent_closed = closed[-240:]
     for t in recent_closed:
@@ -8770,6 +8974,19 @@ def _enhanced_auto_learn():
         if t.get('result') == 'win':
             sr['win'] += 1
         sr['pnl_sum'] += metric
+
+        market_state = _market_state_from_trade(t)
+        ms = market_state_stats.setdefault(market_state, {'count': 0, 'win': 0, 'pnl_sum': 0.0})
+        ms['count'] += 1
+        if t.get('result') == 'win':
+            ms['win'] += 1
+        ms['pnl_sum'] += metric
+        smk = f'{sym}|{market_state}'
+        sms = symbol_market_state_stats.setdefault(smk, {'count': 0, 'win': 0, 'pnl_sum': 0.0})
+        sms['count'] += 1
+        if t.get('result') == 'win':
+            sms['win'] += 1
+        sms['pnl_sum'] += metric
 
         setup_mode = _normalize_setup_mode((t.get('breakdown') or {}).get('Setup') or t.get('setup_label') or '')
         eq_val = float((t.get('breakdown') or {}).get('進場品質', 0) or 0)
