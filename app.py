@@ -109,6 +109,7 @@ AUTO_ORDER_AUDIT    = {}        # 記錄每輪為何沒下單
 API_ERROR_STREAK    = 0
 PROTECTION_FAIL_STREAK = 0
 AUTO_AI_MODE = 'normal'
+AI_FULL_SCORE_CONTROL = True
 LAST_MARKET_CONSENSUS = {}
 CACHE_LOCK          = threading.RLock()
 PROTECTION_LOCK     = threading.RLock()
@@ -240,10 +241,10 @@ _DT = {
 _DT_LOCK = threading.Lock()
 
 def _estimate_ai_threshold_target(top_sigs=None):
-    """由當前候選訊號品質自動估計門檻，不再依賴固定最高/最低設定。"""
+    """由 AI 評分後的候選訊號品質自動估計門檻，避免再用固定 RR/EQ 公式卡死。"""
     sigs = list(top_sigs or [])[:8]
     if not sigs:
-        return 58.0, '無強訊號，維持保守'
+        return 56.0, '無候選訊號，維持觀察'
 
     scored = []
     for sig in sigs:
@@ -251,75 +252,48 @@ def _estimate_ai_threshold_target(top_sigs=None):
             score = abs(float(sig.get('score', 0) or 0))
             rr = float(sig.get('rr_ratio', 0) or 0)
             eq = float(sig.get('entry_quality', 0) or 0)
+            ai_cov = float((sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)
+            ai_scnt = float((sig.get('breakdown') or {}).get('AISampleCount', 0) or 0)
             regime_conf = float(sig.get('regime_confidence', 0) or 0)
             anti_chase_ok = bool(sig.get('anti_chase_ok', True))
-            breakdown = dict(sig.get('breakdown') or {})
-            profile = _ai_strategy_profile(
-                str(sig.get('symbol') or ''),
-                regime=str(sig.get('regime') or breakdown.get('Regime') or 'neutral'),
-                setup=str(sig.get('setup_label') or breakdown.get('Setup') or ''),
-            )
-            sample_cnt = float(profile.get('sample_count', 0) or 0)
-            phase = str(profile.get('phase') or 'learning')
+            profile = _ai_strategy_profile(str(sig.get('symbol') or ''), regime=str(sig.get('regime') or ((sig.get('breakdown') or {}).get('Regime')) or 'neutral'), setup=str(sig.get('setup_label') or ((sig.get('breakdown') or {}).get('Setup')) or ''))
             quality = 0.0
-            quality += max(min((score - 50.0) * 0.20, 5.0), -3.5)
-            quality += max(min((rr - 1.20) * 5.5, 4.2), -4.0)
-            quality += max(min((eq - 2.10) * 3.2, 3.2), -3.0)
-            quality += max(min(regime_conf * 5.0, 2.2), -1.0)
-            quality += min(sample_cnt / 18.0, 2.4)
-            if phase == 'full':
-                quality += 1.25
-            elif phase == 'semi':
-                quality += 0.55
-            if bool(profile.get('ready')):
-                quality += 0.9
-            if str(profile.get('status') or '') == 'reject':
-                quality -= 1.4
-            if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
-                quality -= 3.5
+            quality += (score - 50.0) / 18.0
+            quality += max(min((rr - 1.0) * 1.1, 1.8), -1.2)
+            quality += max(min((eq - 1.6) * 0.6, 1.2), -1.0)
+            quality += ai_cov * 2.8
+            quality += min(ai_scnt / 25.0, 1.8)
+            quality += regime_conf * 1.2
+            quality += float(profile.get('ev_per_trade', 0) or 0) * 14.0
+            quality += (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.03
             if not anti_chase_ok:
-                quality -= 1.8
-            if bool(sig.get('fvg_valid')):
-                quality += 0.7
+                quality -= 0.9
+            if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
+                quality -= 2.0
             scored.append((quality, sig, profile))
         except Exception:
             continue
 
     if not scored:
-        return 58.0, '訊號解析不足，維持保守'
+        return 56.0, '候選訊號不足，維持觀察'
 
     scored.sort(key=lambda x: x[0], reverse=True)
     best_q = float(scored[0][0])
     avg_q = sum(float(x[0]) for x in scored[:3]) / max(min(3, len(scored)), 1)
     best_sig = scored[0][1]
     best_profile = scored[0][2]
-    top_score = abs(float(best_sig.get('score', 0) or 0))
-    top_rr = float(best_sig.get('rr_ratio', 0) or 0)
-    top_eq = float(best_sig.get('entry_quality', 0) or 0)
-
-    target = 57.5
-    target -= max(min((avg_q - 1.2) * 1.55, 6.2), -4.5)
-    target -= max(min((top_score - 58.0) * 0.08, 2.4), -1.8)
-    target -= max(min((top_rr - 1.35) * 1.8, 1.8), -1.4)
-    target -= max(min((top_eq - 2.30) * 0.95, 1.2), -1.0)
-
+    target = 58.0 - avg_q * 2.2 - max(best_q - 1.0, 0.0) * 1.2
     if bool(best_profile.get('ready')):
         target -= 1.0
-    if str(best_profile.get('phase') or '') == 'learning' and float(best_profile.get('sample_count', 0) or 0) < 5:
-        target += 0.8
     if bool(best_profile.get('symbol_blocked')) or bool(best_profile.get('strategy_blocked')):
-        target += 2.5
-
-    # 真正的 AI 自適應範圍：保留安全欄杆，但不再受舊高低門檻規則控制
-    target = max(46.0, min(72.0, target))
-    note = 'AI動態:{} | top {:.1f} | RR {:.2f} | EQ {:.2f} | 樣本 {}'.format(
-        str(best_profile.get('phase') or 'learning'), top_score, top_rr, top_eq, int(best_profile.get('sample_count', 0) or 0)
-    )
+        target += 3.0
+    target = max(40.0, min(74.0, target))
+    note = 'AI主控 | top {:.1f} | cov {:.2f} | 樣本 {}'.format(abs(float(best_sig.get('score', 0) or 0)), float(((best_sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)), int(((best_sig.get('breakdown') or {}).get('AISampleCount', 0) or 0)))
     return round(target, 2), note
 
 
 def update_dynamic_threshold(top_sigs=None):
-    """AI 自主門檻：依候選訊號/學習狀態動態調整，不再套用舊版固定高低門檻。"""
+    """AI 自主門檻：依 AI 分數覆蓋率、學習樣本與持倉壓力動態調整。"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
         dt = _DT
@@ -329,38 +303,36 @@ def update_dynamic_threshold(top_sigs=None):
         target, note = _estimate_ai_threshold_target(top_sigs)
         if pos_count >= MAX_OPEN_POSITIONS:
             dt['full_rounds'] = dt.get('full_rounds', 0) + 1
-            target = min(72.0, target + min(4.0, dt['full_rounds'] * 0.45))
+            target += min(6.0, dt['full_rounds'] * 0.65)
         else:
             dt['full_rounds'] = 0
 
-        if top_sigs:
-            strong_count = 0
-            for sig in list(top_sigs)[:5]:
-                try:
-                    sig_score = abs(float(sig.get('score', 0) or 0))
-                    sig_rr = float(sig.get('rr_ratio', 0) or 0)
-                    sig_eq = float(sig.get('entry_quality', 0) or 0)
-                    if sig_score >= max(target - 1.5, 50.0) and sig_rr >= 1.20 and sig_eq >= 1.90:
-                        strong_count += 1
-                except Exception:
-                    pass
-            if strong_count == 0:
-                dt['no_order_rounds'] = dt.get('no_order_rounds', 0) + 1
-                target = min(70.0, target + min(2.2, dt['no_order_rounds'] * 0.55))
-            else:
-                dt['no_order_rounds'] = 0
-                if strong_count >= 2:
-                    target = max(46.0, target - min(1.8, strong_count * 0.45))
-        else:
+        strong_count = 0
+        for sig in list(top_sigs or [])[:5]:
+            try:
+                sig_score = abs(float(sig.get('score', 0) or 0))
+                ai_cov = float((sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)
+                pwin = float((sig.get('decision_calibrator') or {}).get('p_win_est', 0.5) or 0.5)
+                if sig_score >= max(48.0, target - 2.0) and (ai_cov >= 0.18 or pwin >= 0.51):
+                    strong_count += 1
+            except Exception:
+                pass
+
+        if strong_count == 0:
             dt['no_order_rounds'] = dt.get('no_order_rounds', 0) + 1
+            target += min(2.5, dt['no_order_rounds'] * 0.45)
+        else:
+            dt['no_order_rounds'] = 0
+            if strong_count >= 2:
+                target -= min(2.0, strong_count * 0.5)
 
         prev = float(dt.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
-        new_val = round(prev * 0.62 + float(target) * 0.38, 2)
-        new_val = max(46.0, min(72.0, new_val))
+        new_val = round(prev * 0.55 + float(target) * 0.45, 2)
+        new_val = max(40.0, min(74.0, new_val))
         dt['current'] = new_val
         ORDER_THRESHOLD = new_val
         dt['last_ai_note'] = note
-        phase = 'AI積極' if new_val <= 51 else 'AI均衡' if new_val <= 60 else 'AI保守'
+        phase = 'AI積極' if new_val <= 50 else 'AI均衡' if new_val <= 61 else 'AI保守'
         print('🧠 AI門檻更新 {:.1f} → {:.1f} | {}'.format(prev, new_val, note))
         update_state(threshold_info={
             'current': new_val,
@@ -373,20 +345,20 @@ def update_dynamic_threshold(top_sigs=None):
         })
 
 def record_order_placed():
-    """下單後呼叫：只做溫和回拉，避免把 AI 動態門檻重設成固定值。"""
+    """下單後僅做非常輕微的過熱抑制，不再把門檻拉回固定區間。"""
     global ORDER_THRESHOLD
     with _DT_LOCK:
         _DT['last_order_time'] = datetime.now()
         _DT['no_order_rounds'] = 0
         _DT['empty_rounds'] = 0
         prev = float(_DT.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
-        nudged = round(prev + min(1.6, max(0.6, (58.0 - prev) * 0.25)), 2) if prev < 58.0 else round(min(prev + 0.4, 66.0), 2)
-        _DT['current'] = max(46.0, min(72.0, nudged))
+        nudged = round(min(prev + 0.8, 74.0), 2)
+        _DT['current'] = max(40.0, min(74.0, nudged))
         ORDER_THRESHOLD = _DT['current']
-        print('↩️ AI門檻微調至{}（新下單後抑制過度連開）'.format(_DT['current']))
+        print('↩️ AI門檻微調至{}（避免短時間過度連開）'.format(_DT['current']))
         update_state(threshold_info={
             'current': _DT['current'],
-            'phase': 'AI均衡' if _DT['current'] <= 60 else 'AI保守',
+            'phase': 'AI積極' if _DT['current'] <= 50 else 'AI均衡' if _DT['current'] <= 61 else 'AI保守',
             'full_rounds': _DT.get('full_rounds', 0),
             'empty_rounds': _DT.get('empty_rounds', 0),
             'no_order_rounds': _DT.get('no_order_rounds', 0),
@@ -1026,9 +998,9 @@ def fvg_order_monitor_thread():
                     else:
                         sc = float(cache.get('analysis_score', sc) or sc)
                     cancel_reason = None
-                    if order['side'] == 'long' and sc < 30:
+                    if order['side'] == 'long' and sc < max(18, float(ORDER_THRESHOLD) * 0.55):
                         cancel_reason = '做多分數不足{}（<30），取消掛單'.format(round(sc, 1))
-                    elif order['side'] == 'short' and sc > -30:
+                    elif order['side'] == 'short' and sc > -max(18, float(ORDER_THRESHOLD) * 0.55):
                         cancel_reason = '做空分數不足{}（>-30），取消掛單'.format(round(sc, 1))
                     elif order['side'] == 'long' and support > 0 and curr < support * 0.998:
                         cancel_reason = '跌破支撐{:.4f}，取消做多掛單'.format(support)
@@ -2827,6 +2799,115 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         phase = 'full'
 
     base_threshold = float(eff_threshold)
+    fit_ok, fit_note = _regime_setup_fit(regime, setup)
+    mode = str(profile.get('strategy_mode') or 'main')
+    rotation_adj, rotation_notes = _symbol_rotation_adjustment(symbol)
+    eq_adj, eq_note = _entry_quality_feedback(symbol, regime, setup, eq)
+    execution_snapshot = _execution_quality_state(sig)
+
+    if AI_FULL_SCORE_CONTROL:
+        ai_cov = float(bd.get('AIScoreCoverage', 0) or 0)
+        ai_scnt = int(bd.get('AISampleCount', 0) or 0)
+        ai_threshold = base_threshold + float(profile.get('threshold_adjust', 0) or 0)
+        if phase == 'learning':
+            ai_threshold = max(42.0, min(62.0, ai_threshold - 4.0))
+        elif phase == 'semi':
+            ai_threshold = max(43.0, min(68.0, ai_threshold))
+        else:
+            ai_threshold = max(44.0, min(72.0, ai_threshold + max(0.0, 0.8 - ai_cov) * 4.0))
+        if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
+            ai_threshold += 4.0
+
+        ai_score_adj = float(profile.get('ev_per_trade', 0) or 0) * 24.0
+        ai_score_adj += (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.06
+        ai_score_adj += eq_adj
+        ai_score_adj += ai_cov * 6.0
+        ai_score_adj += min(ai_scnt / 18.0, 3.0)
+
+        decision_calibrator = calibrate_trade_decision(
+            score=score + rotation_adj + ai_score_adj,
+            threshold=ai_threshold,
+            rr_ratio=max(rr, 0.8),
+            entry_quality=max(eq, 0.5),
+            regime_confidence=float(sig.get('regime_confidence', 0.0) or 0.0),
+            profile=profile,
+            execution_quality=execution_snapshot,
+            market_consensus=dict(LAST_MARKET_CONSENSUS or {}),
+        )
+        effective_score = score + rotation_adj + ai_score_adj + max(0.0, (decision_calibrator.get('p_win_est', 0.5) - 0.5) * 10.0)
+        setup_ok = bool(fit_ok)
+        if phase == 'full' and ai_scnt < AI_MIN_SAMPLE_EFFECT and ai_cov < 0.12 and score < ai_threshold + 3.0:
+            setup_ok = False
+        gating = {
+            'regime': bool(mkt_ok and (not (NEUTRAL_REGIME_BLOCK and regime == 'neutral' and phase == 'full'))),
+            'setup': bool(setup_ok),
+            'risk': bool(side_ok and same_dir_cnt < MAX_SAME_DIRECTION and symbol not in already_closing),
+            'symbol': bool(symbol not in pos_syms and symbol not in SHORT_TERM_EXCLUDED and can_reenter_symbol(symbol) and sig.get('allowed', True)),
+            'trigger': bool(effective_score >= ai_threshold),
+            'calibrated_winrate': bool(float(decision_calibrator.get('p_win_est', 0.0) or 0.0) >= (0.47 if phase == 'learning' else 0.49 if phase == 'semi' else 0.51)),
+            'positive_ev': bool(float(decision_calibrator.get('expected_value_est', -1.0) or -1.0) > (-0.01 if phase == 'learning' else 0.0)),
+        }
+        base_ok = all(gating.get(k, True) for k in DECISION_PRIORITY_ORDER) and gating.get('calibrated_winrate', True) and gating.get('positive_ev', True)
+        ai_ok = True
+        reasons = []
+        reasons.append({'learning': '探索模式', 'semi': '半接管', 'full': 'AI真接管'}[phase])
+        reasons.append('AI全控分啟用')
+        reasons.append('決策優先序:' + '>'.join(DECISION_PRIORITY_ORDER))
+        reasons.append(f'全域樣本 {global_live_count}')
+        reasons.append(f'AI覆蓋率 {ai_cov:.2f}')
+        reasons.append(f'AI特徵樣本 {ai_scnt}')
+        if rotation_notes:
+            reasons.extend(rotation_notes)
+        if bool(profile.get('symbol_blocked')):
+            ai_ok = False
+            reasons.append('幣種長期虧損封鎖')
+        if bool(profile.get('strategy_blocked')):
+            ai_ok = False
+            reasons.append('策略長期虧損封鎖')
+        if not fit_ok:
+            reasons.append(fit_note)
+        if profile.get('ready'):
+            reasons.append('AI策略已就緒')
+        if profile.get('note'):
+            reasons.append(str(profile.get('note')))
+        if eq_note:
+            reasons.append(eq_note)
+        reasons.append('AI分數調整 {:+.2f}'.format(ai_score_adj))
+        reasons.append('校準勝率 {:.1f}%'.format(float(decision_calibrator.get('p_win_est', 0.0) or 0.0) * 100.0))
+        reasons.append('校準EV {:+.3f}'.format(float(decision_calibrator.get('expected_value_est', 0.0) or 0.0)))
+        if not base_ok:
+            if effective_score < ai_threshold:
+                reasons.append('分數未過AI門檻')
+            if not gating.get('setup', True):
+                reasons.append('AI判定結構未對齊')
+            if not gating.get('calibrated_winrate', True):
+                reasons.append('校準勝率不足')
+            if not gating.get('positive_ev', True):
+                reasons.append('校準EV不足')
+        normalized = normalize_decision_summary(
+            allow_now=bool(base_ok and ai_ok),
+            gating=gating,
+            reasons=list(dict.fromkeys(reasons)),
+            profile=dict(profile, phase=phase, allow_profile=ai_ok),
+            effective_score=effective_score,
+            effective_threshold=ai_threshold,
+            decision_calibrator=decision_calibrator,
+            signal_snapshot={'score': score, 'threshold_raw': base_threshold, 'threshold_calibrated': ai_threshold, 'execution_quality': execution_snapshot},
+        )
+        return {
+            'allow_now': bool(base_ok and ai_ok),
+            'effective_threshold': round(ai_threshold, 2),
+            'effective_score': round(effective_score, 2),
+            'rotation_adj': round(rotation_adj, 2),
+            'reasons': list(dict.fromkeys(reasons)),
+            'profile': dict(profile, phase=phase),
+            'gating': gating,
+            'decision_calibrator': decision_calibrator,
+            'decision_explain': merge_decision_explain(gating=gating, calibrator=decision_calibrator, profile=dict(profile, phase=phase), reasons=reasons),
+            **normalized,
+        }
+
+        base_threshold = float(eff_threshold)
     fit_ok, fit_note = _regime_setup_fit(regime, setup)
     mode = str(profile.get('strategy_mode') or 'main')
 
@@ -7436,6 +7517,7 @@ def _default_ai_db():
         "regime_stats": {},
         "symbol_regime_stats": {},
         "indicator_weights": {},
+        "ai_feature_model": {"features": {}, "meta": {"samples": 0, "wins": 0, "avg_pnl": 0.0, "updated_at": "--"}},
         "combo_stats": {},
         "param_sets": {
             "trend":  {"sl_mult": 1.9, "tp_mult": 3.8, "breakeven_atr": 1.0, "trail_trigger_atr": 1.8, "trail_pct": 0.032},
@@ -7671,6 +7753,237 @@ def _safe_num(v, default=0.0):
         return float(v)
     except Exception:
         return float(default)
+
+
+def _ai_feature_scale(name, value):
+    name = str(name or '').lower()
+    v = _safe_num(value)
+    av = abs(v)
+    if av <= 1e-9:
+        return 0.0
+    if 'rr' in name:
+        return math.tanh(v / 2.2)
+    if 'conf' in name or 'quality' in name or 'gate' in name:
+        return math.tanh(v / 4.0)
+    if 'score' in name or 'bias' in name or 'pnl' in name or 'drawdown' in name:
+        return math.tanh(v / 12.0)
+    if 'atr' in name or 'width' in name or 'ratio' in name or 'vol' in name or 'move' in name:
+        return math.tanh(v / 1.8)
+    if av > 100:
+        return math.tanh(v / 100.0)
+    if av > 10:
+        return math.tanh(v / 10.0)
+    return math.tanh(v / 3.5)
+
+
+def _sanitize_ai_feature_name(name):
+    out = []
+    for ch in str(name or '').strip().lower():
+        if ch.isalnum() or ch in ('_', '-', '|', ':'):
+            out.append(ch)
+        elif ch in (' ', '/', '.'):
+            out.append('_')
+    return ''.join(out)[:80] or 'unknown'
+
+
+def _infer_signal_side(score, entry=0.0, sl=0.0, tp=0.0):
+    entry = _safe_num(entry)
+    sl = _safe_num(sl)
+    tp = _safe_num(tp)
+    if entry and tp and sl:
+        if tp > entry and sl < entry:
+            return 1
+        if tp < entry and sl > entry:
+            return -1
+    return 1 if _safe_num(score) >= 0 else -1
+
+
+def _extract_ai_signal_features(symbol, side, breakdown=None, regime_info=None, desc='', extra=None):
+    bd = dict(breakdown or {})
+    regime_info = dict(regime_info or {})
+    feats = {}
+
+    def add(name, value):
+        key = _sanitize_ai_feature_name(name)
+        val = _safe_num(value, None)
+        if val is None:
+            return
+        if math.isnan(val) or math.isinf(val):
+            return
+        val = max(min(val, 4.0), -4.0)
+        if abs(val) < 1e-9:
+            return
+        feats[key] = round(val, 6)
+
+    add('side_bias', 1.0 if side > 0 else -1.0)
+    add('regime_confidence', _ai_feature_scale('regime_conf', regime_info.get('confidence', 0)))
+    add('tempo_score', _ai_feature_scale('tempo_score', regime_info.get('tempo_score', 0)))
+    add('move_3bars_pct', _ai_feature_scale('move_3bars_pct', regime_info.get('move_3bars_pct', 0)))
+    add('vol_ratio', _ai_feature_scale('vol_ratio', regime_info.get('vol_ratio', 0)))
+    add('bb_width', _ai_feature_scale('bb_width', regime_info.get('bb_width', 0)))
+
+    direction = str(regime_info.get('direction', '中性') or '中性')
+    if direction == '多':
+        add('market_direction_alignment', 1.0 if side > 0 else -1.0)
+    elif direction == '空':
+        add('market_direction_alignment', 1.0 if side < 0 else -1.0)
+
+    regime = str(bd.get('Regime') or regime_info.get('regime') or 'neutral')
+    add(f'regime::{regime}', 1.0)
+
+    setup = str(bd.get('Setup') or '').strip()
+    if setup:
+        add(f'setup::{setup}', 1.0)
+
+    add(f'symbol::{symbol}', 1.0)
+
+    directional_keys = {'regimebias', '方向品質', '4h趨勢不順', '追價風險', 'signalquality', 'learnedge', 'regimescoreadj'}
+    skip = {'setup', 'regime', 'regimedir'}
+    for k, v in bd.items():
+        ks = _sanitize_ai_feature_name(k)
+        if ks in skip:
+            continue
+        if isinstance(v, bool):
+            add(f'flag::{ks}', 1.0 if v else -1.0)
+            continue
+        if isinstance(v, (int, float)):
+            scaled = _ai_feature_scale(ks, v)
+            if ks in directional_keys:
+                scaled *= side
+            add(f'bd::{ks}', scaled)
+        elif isinstance(v, str) and v:
+            add(f'cat::{ks}::{v}', 1.0)
+
+    tags = []
+    if isinstance(desc, str) and desc:
+        tags.extend([p.strip() for p in desc.split('|') if p.strip()][:20])
+    if isinstance(extra, (list, tuple)):
+        tags.extend([str(x).strip() for x in extra if str(x).strip()][:20])
+    for tag in tags[:30]:
+        add(f'tag::{tag}', 1.0)
+
+    return feats
+
+
+def _trade_outcome_edge(trade):
+    metric = float(_trade_learn_metric(trade) or 0.0)
+    result = str(trade.get('result') or '')
+    edge = math.tanh(metric / 1.4)
+    if result == 'win':
+        edge = max(edge, 0.35)
+    elif result == 'loss':
+        edge = min(edge, -0.35)
+    return float(max(min(edge, 1.0), -1.0))
+
+
+def _build_ai_feature_model_from_trades(trades):
+    model = {'features': {}, 'meta': {'samples': 0, 'wins': 0, 'avg_pnl': 0.0, 'updated_at': tw_now_str('%Y-%m-%d %H:%M:%S')}}
+    cleaned = [t for t in list(trades or []) if _is_live_source((t or {}).get('source')) and str((t or {}).get('result') or '') in ('win', 'loss')]
+    if not cleaned:
+        return model
+    total_pnl = 0.0
+    wins = 0
+    for t in cleaned[-360:]:
+        bd = dict(t.get('breakdown') or {})
+        side = 1 if str(t.get('side') or '').lower() == 'long' else -1
+        regime_info = {
+            'regime': bd.get('Regime', 'neutral'),
+            'direction': bd.get('RegimeDir', '中性'),
+            'confidence': bd.get('RegimeConf', 0.5),
+            'tempo_score': bd.get('TempoScore', 0.0),
+        }
+        feats = _extract_ai_signal_features(
+            str(t.get('symbol') or 'NA'),
+            side,
+            breakdown=bd,
+            regime_info=regime_info,
+            desc=t.get('desc') or '',
+            extra=[t.get('setup_label') or '']
+        )
+        edge = _trade_outcome_edge(t)
+        pnl_metric = float(_trade_learn_metric(t) or 0.0)
+        total_pnl += pnl_metric
+        if str(t.get('result') or '') == 'win':
+            wins += 1
+        for feat, val in feats.items():
+            rec = model['features'].setdefault(feat, {'count': 0, 'edge_sum': 0.0, 'edge_abs': 0.0, 'wins': 0, 'pnl_sum': 0.0, 'value_abs_sum': 0.0})
+            rec['count'] += 1
+            rec['edge_sum'] += edge * float(val)
+            rec['edge_abs'] += abs(edge * float(val))
+            rec['pnl_sum'] += pnl_metric * float(val)
+            rec['value_abs_sum'] += abs(float(val))
+            if str(t.get('result') or '') == 'win':
+                rec['wins'] += 1
+    features_out = {}
+    for feat, rec in model['features'].items():
+        count = int(rec.get('count', 0) or 0)
+        if count < 3:
+            continue
+        avg_edge = float(rec.get('edge_sum', 0.0) or 0.0) / max(count, 1)
+        avg_pnl = float(rec.get('pnl_sum', 0.0) or 0.0) / max(count, 1)
+        win_rate = float(rec.get('wins', 0) or 0) / max(count, 1)
+        confidence = min(count / 18.0, 1.0)
+        weight = avg_edge * 52.0 + avg_pnl * 8.0 + (win_rate - 0.5) * 10.0
+        if abs(weight) < 0.18:
+            continue
+        features_out[feat] = {
+            'weight': round(weight, 6),
+            'count': count,
+            'confidence': round(confidence, 6),
+            'win_rate': round(win_rate, 6),
+            'avg_pnl': round(avg_pnl, 6),
+        }
+    model['features'] = features_out
+    model['meta'] = {
+        'samples': len(cleaned[-360:]),
+        'wins': wins,
+        'avg_pnl': round(total_pnl / max(len(cleaned[-360:]), 1), 6),
+        'updated_at': tw_now_str('%Y-%m-%d %H:%M:%S'),
+    }
+    return model
+
+
+def _score_signal_with_ai_model(symbol, side, breakdown=None, regime_info=None, desc='', fallback_score=0.0, extra=None):
+    with AI_LOCK:
+        model = dict(AI_DB.get('ai_feature_model') or {})
+    features = _extract_ai_signal_features(symbol, side, breakdown=breakdown, regime_info=regime_info, desc=desc, extra=extra)
+    feature_model = dict(model.get('features') or {})
+    covered = []
+    raw = 0.0
+    total_abs = 0.0
+    for feat, val in features.items():
+        meta = feature_model.get(feat)
+        if not meta:
+            continue
+        conf = max(0.12, float(meta.get('confidence', 0.0) or 0.0))
+        weight = float(meta.get('weight', 0.0) or 0.0)
+        contrib = float(val) * weight * conf
+        raw += contrib
+        total_abs += abs(weight * conf)
+        covered.append((feat, round(contrib, 4), int(meta.get('count', 0) or 0)))
+    coverage = min(len(covered) / 12.0, 1.0)
+    meta = dict(model.get('meta') or {})
+    sample_cnt = int(meta.get('samples', 0) or 0)
+    sample_conf = min(sample_cnt / 60.0, 1.0)
+    strategy = _strategy_score_lookup(symbol, str((breakdown or {}).get('Regime') or (regime_info or {}).get('regime') or 'neutral'), str((breakdown or {}).get('Setup') or ''))
+    profile = _ai_strategy_profile(symbol, regime=str((breakdown or {}).get('Regime') or (regime_info or {}).get('regime') or 'neutral'), setup=str((breakdown or {}).get('Setup') or ''))
+    strategy_boost = float(strategy.get('ev_per_trade', 0.0) or 0.0) * 22.0 + (float(strategy.get('win_rate', 50.0) or 50.0) - 50.0) * 0.10
+    profile_boost = float(profile.get('ev_per_trade', 0.0) or 0.0) * 16.0 + (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.06
+    base_from_model = raw * 7.2 + strategy_boost + profile_boost
+    fallback_weight = 0.0 if AI_FULL_SCORE_CONTROL else max(0.15, 1.0 - sample_conf * 0.7)
+    mixed = base_from_model + float(fallback_score or 0.0) * fallback_weight
+    score = max(min(round(mixed, 2), 100.0), -100.0)
+    return {
+        'score': score,
+        'coverage': round(coverage, 4),
+        'sample_confidence': round(sample_conf, 4),
+        'sample_count': sample_cnt,
+        'raw': round(raw, 6),
+        'strategy_boost': round(strategy_boost + profile_boost, 4),
+        'top_contributors': [
+            {'feature': f, 'contribution': c, 'count': n} for f, c, n in sorted(covered, key=lambda x: abs(x[1]), reverse=True)[:12]
+        ],
+    }
 
 
 def _signal_quality_from_breakdown(breakdown, side):
@@ -7996,7 +8309,16 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
         rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
         est_pnl = round(abs(tp - entry) / max(entry, 1e-9) * 100 * 20, 2)
 
-    final_score = round(max(min(score + score_boost, 100), -100), 1)
+    ai_score_payload = _score_signal_with_ai_model(
+        symbol,
+        side,
+        breakdown=breakdown,
+        regime_info=regime_info,
+        desc=desc,
+        fallback_score=(score + score_boost),
+        extra=extra,
+    )
+    final_score = round(float(ai_score_payload.get('score', score + score_boost) or 0.0), 1)
     breakdown['Regime'] = regime
     breakdown['RegimeConf'] = round(conf, 3)
     breakdown['RegimeDir'] = direction
@@ -8009,13 +8331,20 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
     breakdown['RR'] = round(rr, 2)
     breakdown['AdaptiveSL'] = round(sl_mult, 2)
     breakdown['AdaptiveTP'] = round(tp_mult, 2)
+    breakdown['AIScoreCoverage'] = round(float(ai_score_payload.get('coverage', 0.0) or 0.0), 3)
+    breakdown['AISampleConfidence'] = round(float(ai_score_payload.get('sample_confidence', 0.0) or 0.0), 3)
+    breakdown['AISampleCount'] = int(ai_score_payload.get('sample_count', 0) or 0)
+    breakdown['AIStrategyBoost'] = round(float(ai_score_payload.get('strategy_boost', 0.0) or 0.0), 3)
+    top_ai = ai_score_payload.get('top_contributors', []) or []
+    if top_ai:
+        breakdown['AITopFeature'] = str(top_ai[0].get('feature') or '')
 
     desc = (desc + '|' if desc else '') + '市場:{}({}/{:.0%}/{})'.format(regime, direction, conf, tempo)
     if extra:
         desc += '|' + '|'.join(dict.fromkeys(extra))
 
     with AI_LOCK:
-        AI_PANEL['symbol_regimes'][symbol] = dict(regime_info, score_adjust=round(score_boost, 2), quality=round(quality_boost, 2), learn_edge=round(learn_boost, 2))
+        AI_PANEL['symbol_regimes'][symbol] = dict(regime_info, score_adjust=round(score_boost, 2), quality=round(quality_boost, 2), learn_edge=round(learn_boost, 2), ai_score=round(final_score, 2), ai_score_coverage=round(float(ai_score_payload.get('coverage', 0.0) or 0.0), 3))
         AI_PANEL['regime'] = regime
         AI_PANEL['params'].update({'sl_mult': sl_mult,'tp_mult': tp_mult,'breakeven_atr': float(params.get('breakeven_atr', 0.9)),'trail_trigger_atr': float(params.get('trail_trigger_atr', 1.4)),'trail_pct': float(params.get('trail_pct', 0.035))})
     return final_score, desc, entry, sl, tp, est_pnl, breakdown, atr, atr15, atr4h, sl_mult, tp_mult
@@ -8182,12 +8511,17 @@ def _enhanced_auto_learn():
                 p['sl_mult'] = round(max(float(p.get('sl_mult', 2.0)) * 0.99, 1.2), 2)
 
     db['param_sets'] = apply_exit_learning_to_params(db.get('param_sets', {}), recent_closed[-90:])
+    try:
+        db['ai_feature_model'] = _build_ai_feature_model_from_trades(recent_closed)
+    except Exception as e:
+        print('AI特徵模型更新失敗:', e)
     db['last_learning'] = tw_now_str('%Y-%m-%d %H:%M:%S')
     save_ai_db(db)
     with AI_LOCK:
         AI_PANEL['best_strategies'] = db.get('strategy_scoreboard', [])[:8]
         AI_PANEL['last_learning'] = db['last_learning']
         AI_PANEL['params'].update(db.get('param_sets', {}).get('neutral', {}))
+        AI_PANEL['params']['score_boost']['ai_feature_samples'] = int(((db.get('ai_feature_model') or {}).get('meta') or {}).get('samples', 0) or 0)
 
 
 def learn_from_closed_trade_legacy_shadow_2(trade_id):
