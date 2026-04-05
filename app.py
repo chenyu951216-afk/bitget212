@@ -89,7 +89,7 @@ POST_CLOSE_COOLDOWN_SEC = 30 * 60                              # 同一個幣平
 MIN_RR_HARD_FLOOR   = DECISION_POLICY['min_rr_hard_floor']      # 自動下單最低 RR
 TREND_AI_SEMI_TRADES = DATASET_POLICY['trend_ai_semi_trades']       # 趨勢學習 30 筆後半介入
 TREND_AI_FULL_TRADES = DATASET_POLICY['trend_ai_full_trades']       # 趨勢學習 50 筆後全介入
-AI_MIN_SAMPLE_EFFECT = 3        # AI主控版：3筆就開始影響決策
+AI_MIN_SAMPLE_EFFECT = 10       # AI成長保護版：至少10筆局部樣本才允許形成有效影響
 SYMBOL_BLOCK_MIN_TRADES = max(int(DATASET_POLICY.get('symbol_block_min_trades', 10) or 10), 18)    # AI主控版：延後幣種封鎖啟用
 SYMBOL_BLOCK_MIN_WINRATE = min(float(DATASET_POLICY.get('symbol_block_min_winrate', 40) or 40), 35.0) # AI主控版：放寬幣種封鎖勝率
 STRATEGY_CAPITAL_MIN_TRADES = DATASET_POLICY['strategy_capital_min_trades']  # 策略資金放大至少要 5 筆以上
@@ -146,6 +146,70 @@ def _dataset_meta():
     meta.setdefault('dataset_mode', 'layered_live_only')
     meta.setdefault('legacy_policy', 'bootstrap_then_fade_out')
     return meta
+
+
+def _ai_effective_rows(closed_only=True):
+    """統一 AI 成長階段的有效實單計算：優先 trusted_live，再退回 soft_live / trend_live。"""
+    try:
+        trusted = get_live_trades(closed_only=closed_only, pool='trusted_live')
+        if trusted:
+            return trusted
+        soft_live = get_live_trades(closed_only=closed_only, pool='soft_live')
+        if soft_live:
+            return soft_live
+        return get_trend_live_trades(closed_only=closed_only)
+    except Exception:
+        return []
+
+
+def _ai_growth_control(effective_count=None):
+    """AI 成長保護模式：
+    <30 筆：只記錄不影響交易
+    30~49 筆：小幅影響
+    50+ 筆：全權接管
+    """
+    if effective_count is None:
+        effective_count = len(_ai_effective_rows(closed_only=True))
+    try:
+        effective_count = int(effective_count or 0)
+    except Exception:
+        effective_count = 0
+
+    if effective_count < TREND_AI_SEMI_TRADES:
+        return {
+            'phase': 'learning',
+            'score_weight': 0.0,
+            'threshold_weight': 0.0,
+            'market_weight': 0.0,
+            'confidence_weight': 0.0,
+            'blend_cap': 0.0,
+            'allow_ai_gate': False,
+            'allow_profile_block': False,
+            'note': f'AI成長保護：前{TREND_AI_SEMI_TRADES}筆只記錄不接管',
+        }
+    if effective_count < TREND_AI_FULL_TRADES:
+        return {
+            'phase': 'semi',
+            'score_weight': 0.35,
+            'threshold_weight': 0.35,
+            'market_weight': 0.35,
+            'confidence_weight': 0.35,
+            'blend_cap': 0.35,
+            'allow_ai_gate': True,
+            'allow_profile_block': True,
+            'note': f'AI成長保護：{TREND_AI_SEMI_TRADES}-{TREND_AI_FULL_TRADES - 1}筆小幅接管',
+        }
+    return {
+        'phase': 'full',
+        'score_weight': 1.0,
+        'threshold_weight': 1.0,
+        'market_weight': 1.0,
+        'confidence_weight': 1.0,
+        'blend_cap': 1.0,
+        'allow_ai_gate': True,
+        'allow_profile_block': True,
+        'note': f'AI成長保護：{TREND_AI_FULL_TRADES}+筆全權接管',
+    }
 
 
 def _execution_quality_state(sig):
@@ -257,10 +321,15 @@ _DT = {
 _DT_LOCK = threading.Lock()
 
 def _estimate_ai_threshold_target(top_sigs=None):
-    """由 AI 評分後的候選訊號品質自動估計門檻，避免再用固定 RR/EQ 公式卡死。"""
+    """由 AI 評分後的候選訊號品質自動估計門檻，並套用 AI 成長保護模式。"""
+    control = _ai_growth_control()
+    phase = str(control.get('phase') or 'learning')
+    base_default = max(52.0, float(ORDER_THRESHOLD_DEFAULT or 52.0))
     sigs = list(top_sigs or [])[:8]
     if not sigs:
-        return 50.0, '無候選訊號，維持觀察'
+        if phase == 'learning':
+            return base_default, control.get('note', 'AI成長保護')
+        return base_default if phase == 'semi' else 50.0, '無候選訊號，維持觀察'
 
     scored = []
     for sig in sigs:
@@ -272,7 +341,11 @@ def _estimate_ai_threshold_target(top_sigs=None):
             ai_scnt = float((sig.get('breakdown') or {}).get('AISampleCount', 0) or 0)
             regime_conf = float(sig.get('regime_confidence', 0) or 0)
             anti_chase_ok = bool(sig.get('anti_chase_ok', True))
-            profile = _ai_strategy_profile(str(sig.get('symbol') or ''), regime=str(sig.get('regime') or ((sig.get('breakdown') or {}).get('Regime')) or 'neutral'), setup=str(sig.get('setup_label') or ((sig.get('breakdown') or {}).get('Setup')) or ''))
+            profile = _ai_strategy_profile(
+                str(sig.get('symbol') or ''),
+                regime=str(sig.get('regime') or ((sig.get('breakdown') or {}).get('Regime')) or 'neutral'),
+                setup=str(sig.get('setup_label') or ((sig.get('breakdown') or {}).get('Setup')) or ''),
+            )
             quality = 0.0
             quality += (score - 50.0) / 18.0
             quality += max(min((rr - 1.0) * 1.1, 1.8), -1.2)
@@ -291,22 +364,33 @@ def _estimate_ai_threshold_target(top_sigs=None):
             continue
 
     if not scored:
-        return 50.0, '候選訊號不足，維持觀察'
+        return base_default, '候選訊號不足，維持觀察'
 
     scored.sort(key=lambda x: x[0], reverse=True)
     best_q = float(scored[0][0])
     avg_q = sum(float(x[0]) for x in scored[:3]) / max(min(3, len(scored)), 1)
     best_sig = scored[0][1]
     best_profile = scored[0][2]
+
     target = 52.0 - avg_q * 2.6 - max(best_q - 1.0, 0.0) * 1.55
     if bool(best_profile.get('ready')):
         target -= 1.8
     if bool(best_profile.get('symbol_blocked')) or bool(best_profile.get('strategy_blocked')):
         target += 1.2
-    target = max(44.0, min(64.0, target))
-    note = 'AI主控 | top {:.1f} | cov {:.2f} | 樣本 {}'.format(abs(float(best_sig.get('score', 0) or 0)), float(((best_sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)), int(((best_sig.get('breakdown') or {}).get('AISampleCount', 0) or 0)))
-    return round(target, 2), note
 
+    if phase == 'learning':
+        target = base_default
+    elif phase == 'semi':
+        target = base_default * 0.65 + float(target) * 0.35
+
+    target = max(50.0 if phase != 'full' else 44.0, min(64.0, target))
+    note = 'AI成長保護({}) | top {:.1f} | cov {:.2f} | 樣本 {}'.format(
+        phase,
+        abs(float(best_sig.get('score', 0) or 0)),
+        float(((best_sig.get('breakdown') or {}).get('AIScoreCoverage', 0) or 0)),
+        int(((best_sig.get('breakdown') or {}).get('AISampleCount', 0) or 0)),
+    )
+    return round(target, 2), note
 
 def update_dynamic_threshold(top_sigs=None):
     """AI 自主門檻：依 AI 分數覆蓋率、學習樣本與持倉壓力動態調整。"""
@@ -316,10 +400,12 @@ def update_dynamic_threshold(top_sigs=None):
         with STATE_LOCK:
             pos_count = len(STATE.get('active_positions', []))
 
+        control = _ai_growth_control()
+        phase = str(control.get('phase') or 'learning')
         target, note = _estimate_ai_threshold_target(top_sigs)
         if pos_count >= MAX_OPEN_POSITIONS:
             dt['full_rounds'] = dt.get('full_rounds', 0) + 1
-            target += min(3.0, dt['full_rounds'] * 0.45)
+            target += min(3.0, dt['full_rounds'] * (0.20 if phase != 'full' else 0.45))
         else:
             dt['full_rounds'] = 0
 
@@ -336,15 +422,22 @@ def update_dynamic_threshold(top_sigs=None):
 
         if strong_count == 0:
             dt['no_order_rounds'] = dt.get('no_order_rounds', 0) + 1
-            target -= min(4.0, dt['no_order_rounds'] * 0.65)
+            if phase == 'full':
+                target -= min(4.0, dt['no_order_rounds'] * 0.65)
+            elif phase == 'semi':
+                target -= min(1.5, dt['no_order_rounds'] * 0.20)
         else:
             dt['no_order_rounds'] = 0
             if strong_count >= 2:
-                target -= min(2.5, strong_count * 0.7)
+                target -= min(2.5 if phase == 'full' else 0.8, strong_count * (0.7 if phase == 'full' else 0.18))
 
         prev = float(dt.get('current', ORDER_THRESHOLD_DEFAULT) or ORDER_THRESHOLD_DEFAULT)
-        new_val = round(prev * 0.35 + float(target) * 0.65, 2)
-        new_val = max(44.0, min(64.0, new_val))
+        if phase == 'learning':
+            new_val = round(max(52.0, float(ORDER_THRESHOLD_DEFAULT or 52.0)), 2)
+        else:
+            mix_ratio = 0.35 if phase == 'semi' else 0.65
+            new_val = round(prev * (1.0 - mix_ratio) + float(target) * mix_ratio, 2)
+            new_val = max(50.0 if phase == 'semi' else 44.0, min(64.0, new_val))
         dt['current'] = new_val
         ORDER_THRESHOLD = new_val
         dt['last_ai_note'] = note
@@ -3030,13 +3123,9 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     market_state, market_state_conf, market_state_note = _classify_market_atlas(regime=regime, setup=setup, breakdown=bd, desc=str(sig.get('desc') or ''))
     market_profile = _market_state_profile(symbol=symbol, regime=regime, setup=setup, market_state=market_state)
 
-    global_live_count = len(get_trend_live_trades(closed_only=True))
-    if global_live_count < TREND_AI_SEMI_TRADES:
-        phase = 'learning'
-    elif global_live_count < TREND_AI_FULL_TRADES:
-        phase = 'semi'
-    else:
-        phase = 'full'
+    global_live_count = len(_ai_effective_rows(closed_only=True))
+    growth_control = _ai_growth_control(global_live_count)
+    phase = str(growth_control.get('phase') or 'learning')
 
     base_threshold = float(eff_threshold)
     fit_ok, fit_note = _regime_setup_fit(regime, setup)
@@ -3048,16 +3137,19 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     if AI_FULL_SCORE_CONTROL:
         ai_cov = float(bd.get('AIScoreCoverage', 0) or 0)
         ai_scnt = int(bd.get('AISampleCount', 0) or 0)
-        ai_threshold = float(base_threshold) + float(profile.get('threshold_adjust', 0) or 0)
-        ai_threshold -= float(market_profile.get('boost', 0.0) or 0.0) * 0.18
+        ai_threshold = float(base_threshold) + float(profile.get('threshold_adjust', 0) or 0) * float(growth_control.get('threshold_weight', 0.0) or 0.0)
+        ai_threshold -= float(market_profile.get('boost', 0.0) or 0.0) * 0.18 * float(growth_control.get('market_weight', 0.0) or 0.0)
         if phase == 'learning':
-            ai_threshold -= 5.0
+            ai_threshold = max(ai_threshold, max(52.0, float(ORDER_THRESHOLD_DEFAULT or 52.0)))
+        elif phase == 'semi':
+            ai_threshold = max(ai_threshold, 50.0)
         elif phase == 'full':
             ai_threshold += max(0.0, 0.72 - ai_cov) * 1.2
         if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
             ai_threshold += 1.5
         ai_threshold = max(44.0, min(64.0, ai_threshold))
 
+        ai_influence = float(growth_control.get('score_weight', 0.0) or 0.0)
         ai_score_adj = float(profile.get('ev_per_trade', 0) or 0) * 24.0
         ai_score_adj += (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.06
         ai_score_adj += eq_adj
@@ -3068,6 +3160,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             ai_score_adj -= 1.25
         if not bool(sig.get('anti_chase_ok', True)):
             ai_score_adj -= 0.85
+        ai_score_adj *= ai_influence
 
         decision_calibrator = calibrate_trade_decision(
             score=score + rotation_adj + ai_score_adj,
@@ -3082,6 +3175,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         p_win_est = float(decision_calibrator.get('p_win_est', 0.5) or 0.5)
         ev_est = float(decision_calibrator.get('expected_value_est', 0.0) or 0.0)
         ai_conf_boost = max(0.0, p_win_est - 0.5) * 10.0 + ev_est * 12.0 + ai_cov * 2.0
+        ai_conf_boost *= float(growth_control.get('confidence_weight', 0.0) or 0.0)
         effective_score = score + rotation_adj + ai_score_adj + ai_conf_boost
         gating = {
             'regime': bool(mkt_ok and (not (NEUTRAL_REGIME_BLOCK and regime == 'neutral' and phase == 'full'))),
@@ -3089,13 +3183,14 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             'risk': bool(side_ok and same_dir_cnt < MAX_SAME_DIRECTION and symbol not in already_closing),
             'symbol': bool(symbol not in pos_syms and symbol not in SHORT_TERM_EXCLUDED and can_reenter_symbol(symbol) and sig.get('allowed', True)),
             'trigger': bool(effective_score >= ai_threshold),
-            'calibrated_winrate': bool(p_win_est >= (0.445 if phase == 'learning' else 0.465 if phase == 'semi' else 0.485)),
-            'positive_ev': bool(ev_est > (-0.03 if phase == 'learning' else -0.015 if phase == 'semi' else -0.005)),
+            'calibrated_winrate': True if not bool(growth_control.get('allow_ai_gate', False)) else bool(p_win_est >= (0.465 if phase == 'semi' else 0.485)),
+            'positive_ev': True if not bool(growth_control.get('allow_ai_gate', False)) else bool(ev_est > (-0.015 if phase == 'semi' else -0.005)),
         }
         base_ok = all(gating.get(k, True) for k in DECISION_PRIORITY_ORDER) and gating.get('calibrated_winrate', True) and gating.get('positive_ev', True)
         ai_ok = True
         reasons = []
         reasons.append({'learning': '探索模式', 'semi': '半接管', 'full': 'AI真接管'}[phase])
+        reasons.append(str(growth_control.get('note') or 'AI成長保護'))
         reasons.append('AI全控分啟用')
         reasons.append('決策優先序:' + '>'.join(DECISION_PRIORITY_ORDER))
         reasons.append(f'全域樣本 {global_live_count}')
@@ -3106,10 +3201,10 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             reasons.append(str(market_profile.get('note')))
         if rotation_notes:
             reasons.extend(rotation_notes)
-        if bool(profile.get('symbol_blocked')):
+        if bool(growth_control.get('allow_profile_block', False)) and bool(profile.get('symbol_blocked')):
             ai_ok = False
             reasons.append('幣種長期虧損封鎖')
-        if bool(profile.get('strategy_blocked')):
+        if bool(growth_control.get('allow_profile_block', False)) and bool(profile.get('strategy_blocked')):
             ai_ok = False
             reasons.append('策略長期虧損封鎖')
         if not fit_ok:
@@ -3161,9 +3256,9 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     mode = str(profile.get('strategy_mode') or 'main')
 
     if phase == 'learning':
-        ai_threshold = max(48.0, min(60.0, base_threshold - 3.0 + float(profile.get('threshold_adjust', 0) or 0)))
-        rr_floor = max(1.18, MIN_RR_HARD_FLOOR - 0.02)
-        min_entry_quality = 1.9 if score >= ai_threshold else 2.25
+        ai_threshold = max(52.0, min(64.0, float(base_threshold)))
+        rr_floor = max(1.24, MIN_RR_HARD_FLOOR)
+        min_entry_quality = 2.25
         if mode == 'breakout' or regime in ('news', 'breakout'):
             ai_threshold = max(ai_threshold, 51.0)
             rr_floor = max(rr_floor, 1.35)
@@ -3173,7 +3268,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             rr_floor = max(1.20, rr_floor)
             min_entry_quality = max(1.8, min_entry_quality - 0.15)
     elif phase == 'semi':
-        ai_threshold = max(49.0, min(66.0, base_threshold + float(profile.get('threshold_adjust', 0) or 0)))
+        ai_threshold = max(50.0, min(66.0, base_threshold + float(profile.get('threshold_adjust', 0) or 0) * 0.35))
         rr_floor = max(1.28, MIN_RR_HARD_FLOOR)
         min_entry_quality = 2.25
         if mode == 'breakout' or regime in ('news', 'breakout'):
@@ -3200,10 +3295,12 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
 
     rotation_adj, rotation_notes = _symbol_rotation_adjustment(symbol)
     eq_adj, eq_note = _entry_quality_feedback(symbol, regime, setup, eq)
+    ai_influence = float(growth_control.get('score_weight', 0.0) or 0.0)
     ai_score_adj = float(profile.get('ev_per_trade', 0) or 0) * 20.0
     ai_score_adj += float(market_profile.get('boost', 0.0) or 0.0) * (0.8 + market_state_conf * 0.3)
     ai_score_adj += (float(profile.get('win_rate', 0) or 0) - 50.0) * 0.04
     ai_score_adj += eq_adj
+    ai_score_adj *= ai_influence
     execution_snapshot = _execution_quality_state(sig)
     decision_calibrator = calibrate_trade_decision(
         score=score + rotation_adj + ai_score_adj,
@@ -3215,7 +3312,7 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         execution_quality=execution_snapshot,
         market_consensus=dict(LAST_MARKET_CONSENSUS or {}),
     )
-    effective_score = score + rotation_adj + ai_score_adj + max(0.0, (decision_calibrator.get('p_win_est', 0.5) - 0.5) * 8.0)
+    effective_score = score + rotation_adj + ai_score_adj + max(0.0, (decision_calibrator.get('p_win_est', 0.5) - 0.5) * 8.0) * float(growth_control.get('confidence_weight', 0.0) or 0.0)
 
     gating = {
         'regime': bool(mkt_ok and (not (NEUTRAL_REGIME_BLOCK and regime == 'neutral' and phase == 'full'))),
@@ -3223,14 +3320,15 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         'risk': bool(side_ok and same_dir_cnt < MAX_SAME_DIRECTION and symbol not in already_closing),
         'symbol': bool(symbol not in pos_syms and symbol not in SHORT_TERM_EXCLUDED and can_reenter_symbol(symbol) and sig.get('allowed', True)),
         'trigger': bool(effective_score >= ai_threshold),
-        'calibrated_winrate': bool(float(decision_calibrator.get('p_win_est', 0.0) or 0.0) >= (0.48 if phase != 'full' else 0.52)),
-        'positive_ev': bool(float(decision_calibrator.get('expected_value_est', -1.0) or -1.0) > 0),
+        'calibrated_winrate': True if not bool(growth_control.get('allow_ai_gate', False)) else bool(float(decision_calibrator.get('p_win_est', 0.0) or 0.0) >= (0.48 if phase != 'full' else 0.52)),
+        'positive_ev': True if not bool(growth_control.get('allow_ai_gate', False)) else bool(float(decision_calibrator.get('expected_value_est', -1.0) or -1.0) > 0),
     }
     base_ok = all(gating.get(k, True) for k in DECISION_PRIORITY_ORDER) and gating.get('calibrated_winrate', True) and gating.get('positive_ev', True)
 
     ai_ok = True
     reasons = []
     reasons.append({'learning': '探索模式', 'semi': '半接管', 'full': 'AI真接管'}[phase])
+    reasons.append(str(growth_control.get('note') or 'AI成長保護'))
     reasons.append('決策優先序:' + '>'.join(DECISION_PRIORITY_ORDER))
     reasons.append('回測只供候選排序')
     reasons.append(f'全域樣本 {global_live_count}')
@@ -8538,7 +8636,10 @@ def _score_signal_with_ai_model(symbol, side, breakdown=None, regime_info=None, 
     discovered_logic_count = len(covered) + len(hint_covered)
     discovery_strength = min(discovered_logic_count / 18.0, 1.0)
     base_from_model = raw * 7.2 + strategy_boost + profile_boost + hint_score
-    adaptive_blend = max(AI_DISCOVERY_BLEND_FLOOR, min(AI_DISCOVERY_BLEND_CEIL, sample_conf * 0.52 + coverage * 0.28 + discovery_strength * 0.20))
+    growth_control = _ai_growth_control(int(profile.get('effective_count', profile.get('sample_count', 0)) or 0))
+    base_blend = sample_conf * 0.52 + coverage * 0.28 + discovery_strength * 0.20
+    blend_cap = AI_DISCOVERY_BLEND_CEIL * float(growth_control.get('blend_cap', 1.0) or 0.0)
+    adaptive_blend = 0.0 if blend_cap <= 0 else max(AI_DISCOVERY_BLEND_FLOOR, min(blend_cap, base_blend))
     fallback_weight = 0.0 if AI_FULL_SCORE_CONTROL else max(0.15, 1.0 - sample_conf * 0.7)
     mixed = base_from_model * adaptive_blend + float(fallback_score or 0.0) * max(1.0 - adaptive_blend, fallback_weight)
     score = max(min(round(mixed, 2), 100.0), -100.0)
@@ -9432,7 +9533,7 @@ def api_ai_db_stats():
     live_closed_trusted = get_live_trades(closed_only=True, pool='trusted_live')
     live_closed_trend = get_trend_live_trades(closed_only=True)
     quarantine_rows = get_live_trades(closed_only=True, pool='quarantine')
-    effective_rows = live_closed_trusted if live_closed_trusted else live_closed_soft if live_closed_soft else live_closed_trend
+    effective_rows = _ai_effective_rows(closed_only=True)
 
     counts_by_symbol = {}
     for t in effective_rows:
@@ -9443,12 +9544,8 @@ def api_ai_db_stats():
     local_ready_symbols = sum(1 for c in counts_by_symbol.values() if c >= AI_MIN_SAMPLE_EFFECT)
 
     effective_count = len(effective_rows)
-    if effective_count < TREND_AI_SEMI_TRADES:
-        ai_phase = 'learning'
-    elif effective_count < TREND_AI_FULL_TRADES:
-        ai_phase = 'semi'
-    else:
-        ai_phase = 'full'
+    growth_control = _ai_growth_control(effective_count)
+    ai_phase = str(growth_control.get('phase') or 'learning')
     ai_ready = bool(effective_count >= TREND_AI_FULL_TRADES and local_ready_symbols > 0)
 
     def _avg_metric(rows, key, default=0.0):
@@ -9508,6 +9605,8 @@ def api_ai_db_stats():
         'trusted_live_count': len(live_closed_trusted),
         'effective_live_count': int(effective_count),
         'reset_from': TREND_LEARNING_RESET_FROM,
+        'ai_influence_mode': ai_phase,
+        'ai_influence_note': str(growth_control.get('note') or ''),
     }
     return jsonify(payload)
 
