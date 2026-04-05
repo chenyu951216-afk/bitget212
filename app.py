@@ -123,6 +123,8 @@ AUDIT_LOCK          = threading.RLock()
 MARKET_DIRECTION_GUARD = MarketDirectionGuard(required_confirmations=2, ttl_seconds=4 * 3600)
 FVG_MONITOR_CACHE   = {}
 FVG_MONITOR_LOCK    = threading.RLock()
+PRE_BREAKOUT_RADAR_CACHE = {}
+PRE_BREAKOUT_RADAR_LOCK = threading.RLock()
 
 STORAGE = BotStorage(
     SQLITE_DB_PATH,
@@ -7011,6 +7013,217 @@ def _detect_pullback_trigger(d15, side):
     return False, '', 0, curr, curr, curr
 
 
+def _normalize_pre_breakout_score(v, lo=0.0, hi=100.0):
+    try:
+        return round(max(lo, min(hi, float(v or 0.0))), 2)
+    except Exception:
+        return round(lo, 2)
+
+
+def analyze_pre_breakout_radar(d15, d4h, d1d=None):
+    """
+    非阻斷型預爆發雷達：
+    - 只提供觀察/排序/顯示資訊
+    - 不直接影響 AI 分數、學習樣本或下單 gating
+    """
+    try:
+        if d15 is None or d4h is None or len(d15) < 80 or len(d4h) < 40:
+            return {
+                'ready': False, 'score': 0.0, 'direction': '中性', 'phase': '資料不足',
+                'long_score': 0.0, 'short_score': 0.0, 'tags': [], 'signals': {}, 'note': '預爆發雷達資料不足',
+            }
+
+        c = d15['c'].astype(float); o = d15['o'].astype(float); h = d15['h'].astype(float); l = d15['l'].astype(float); v = d15['v'].astype(float)
+        curr = float(c.iloc[-1])
+        atr = max(safe_last(ta.atr(h, l, c, length=14), curr * 0.004), curr * 0.003)
+        ema9 = safe_last(ta.ema(c, length=9), curr)
+        ema21 = safe_last(ta.ema(c, length=21), curr)
+        ema55 = safe_last(ta.ema(c, length=55), curr)
+
+        bb = ta.bbands(c, length=20, std=2.0)
+        if bb is None or bb.empty:
+            return {
+                'ready': False, 'score': 0.0, 'direction': '中性', 'phase': '無BB',
+                'long_score': 0.0, 'short_score': 0.0, 'tags': [], 'signals': {}, 'note': '預爆發雷達缺少布林資料',
+            }
+        bb_up = safe_last(bb.iloc[:, 0], curr)
+        bb_mid = safe_last(bb.iloc[:, 1], curr)
+        bb_low = safe_last(bb.iloc[:, 2], curr)
+        width_now = max((bb_up - bb_low) / max(bb_mid, 1e-9), 0.0)
+        width_hist = ((bb.iloc[:, 0] - bb.iloc[:, 2]) / bb.iloc[:, 1].replace(0, np.nan)).dropna().tail(36)
+        width_med = float(width_hist.median()) if len(width_hist) else width_now
+        squeeze_ratio = width_now / max(width_med, 1e-9)
+
+        atr_series = ta.atr(h, l, c, length=14)
+        atr_now = safe_last(atr_series, atr)
+        atr_recent = float(pd.Series(atr_series).tail(10).mean()) if atr_series is not None else atr_now
+        atr_prev = float(pd.Series(atr_series).tail(40).head(20).mean()) if atr_series is not None else atr_now
+        atr_prev = atr_prev if atr_prev == atr_prev and atr_prev > 0 else atr_now
+        atr_compress = atr_recent / max(atr_prev, 1e-9)
+
+        lookback = max(int(BREAKOUT_LOOKBACK or 20), 20)
+        hh = float(h.tail(lookback).iloc[:-1].max()) if len(h) > lookback else float(h.max())
+        ll = float(l.tail(lookback).iloc[:-1].min()) if len(l) > lookback else float(l.min())
+        dist_high_atr = (hh - curr) / max(atr_now, 1e-9)
+        dist_low_atr = (curr - ll) / max(atr_now, 1e-9)
+        near_high = dist_high_atr <= 0.85 and curr <= hh * 1.004
+        near_low = dist_low_atr <= 0.85 and curr >= ll * 0.996
+
+        last_n = 8
+        lows_slope = _linreg_slope(l.tail(last_n).tolist())
+        highs_slope = _linreg_slope(h.tail(last_n).tolist())
+        clamp_highs = highs_slope <= max(curr * 0.00012, atr_now * 0.02)
+        clamp_lows = lows_slope >= -max(curr * 0.00012, atr_now * 0.02)
+
+        vol_recent = float(v.tail(4).mean()) if len(v) >= 4 else float(v.iloc[-1])
+        vol_mid = float(v.tail(16).head(8).mean()) if len(v) >= 16 else vol_recent
+        vol_long = float(v.tail(32).mean()) if len(v) >= 32 else vol_recent
+        vol_build = vol_recent > vol_mid * 1.04 and vol_recent < vol_long * 1.75 if vol_mid > 0 and vol_long > 0 else False
+
+        body = abs(float(c.iloc[-1]) - float(o.iloc[-1]))
+        candle_range = max(float(h.iloc[-1] - l.iloc[-1]), 1e-9)
+        close_pos = (float(c.iloc[-1]) - float(l.iloc[-1])) / candle_range
+        upper_close_pos = (float(h.iloc[-1]) - float(c.iloc[-1])) / candle_range
+
+        ema21_4h = safe_last(ta.ema(d4h['c'], length=21), curr)
+        ema55_4h = safe_last(ta.ema(d4h['c'], length=55), curr)
+        trend_up_4h = curr >= ema21_4h >= ema55_4h
+        trend_dn_4h = curr <= ema21_4h <= ema55_4h
+
+        trend_up_1d = trend_dn_1d = False
+        if d1d is not None and len(d1d) >= 30:
+            ema20_1d = safe_last(ta.ema(d1d['c'], length=20), float(d1d['c'].iloc[-1]))
+            ema50_1d = safe_last(ta.ema(d1d['c'], length=50), float(d1d['c'].iloc[-1]))
+            day_curr = float(d1d['c'].iloc[-1])
+            trend_up_1d = day_curr >= ema20_1d >= ema50_1d
+            trend_dn_1d = day_curr <= ema20_1d <= ema50_1d
+
+        compress_ok = squeeze_ratio <= 0.92 and atr_compress <= 0.94
+        launch_pad_long = near_high and clamp_lows and (trend_up_4h or trend_up_1d)
+        launch_pad_short = near_low and clamp_highs and (trend_dn_4h or trend_dn_1d)
+        micro_trigger_long = curr >= ema9 >= ema21 and close_pos >= 0.58 and body >= atr_now * 0.16
+        micro_trigger_short = curr <= ema9 <= ema21 and upper_close_pos >= 0.58 and body >= atr_now * 0.16
+
+        long_score = 0.0
+        short_score = 0.0
+        tags = []
+        signals = {}
+
+        if compress_ok:
+            long_score += 20; short_score += 20
+            tags.append('波動收斂')
+            signals['compression'] = True
+        if vol_build:
+            long_score += 11; short_score += 11
+            tags.append('量能堆積')
+            signals['volume_build'] = True
+        if near_high:
+            long_score += 19
+            tags.append('逼近上緣')
+            signals['near_break_high'] = round(dist_high_atr, 2)
+        if near_low:
+            short_score += 19
+            tags.append('逼近下緣')
+            signals['near_break_low'] = round(dist_low_atr, 2)
+        if clamp_lows and lows_slope > 0:
+            long_score += 16
+            tags.append('低點抬高')
+            signals['higher_lows'] = round(lows_slope, 6)
+        if clamp_highs and highs_slope < 0:
+            short_score += 16
+            tags.append('高點下壓')
+            signals['lower_highs'] = round(highs_slope, 6)
+        if trend_up_4h:
+            long_score += 10
+            tags.append('4H偏多')
+            signals['trend_4h_up'] = True
+        if trend_dn_4h:
+            short_score += 10
+            tags.append('4H偏空')
+            signals['trend_4h_dn'] = True
+        if trend_up_1d:
+            long_score += 5
+            tags.append('日線偏多')
+            signals['trend_1d_up'] = True
+        if trend_dn_1d:
+            short_score += 5
+            tags.append('日線偏空')
+            signals['trend_1d_dn'] = True
+        if micro_trigger_long:
+            long_score += 8
+            tags.append('短線續攻')
+            signals['micro_long'] = True
+        if micro_trigger_short:
+            short_score += 8
+            tags.append('短線續跌')
+            signals['micro_short'] = True
+
+        long_score = _normalize_pre_breakout_score(long_score)
+        short_score = _normalize_pre_breakout_score(short_score)
+        direction = '中性'
+        score = max(long_score, short_score)
+        phase = '觀察'
+        note = '尚未形成明確預爆發優勢'
+        if long_score >= short_score + 8 and long_score >= 52:
+            direction = '偏多預爆發'
+            phase = '蓄勢待發' if long_score < 68 else '接近突破'
+            note = '偏多預爆發條件較完整，可觀察上緣突破'
+        elif short_score >= long_score + 8 and short_score >= 52:
+            direction = '偏空預爆發'
+            phase = '蓄勢待發' if short_score < 68 else '接近跌破'
+            note = '偏空預爆發條件較完整，可觀察下緣跌破'
+        elif score >= 40:
+            phase = '早期蓄勢'
+            note = '已有部分預爆發條件，但尚未集中到單側'
+
+        return {
+            'ready': bool(score >= 40.0),
+            'score': round(score, 2),
+            'direction': direction,
+            'phase': phase,
+            'long_score': round(long_score, 2),
+            'short_score': round(short_score, 2),
+            'tags': list(dict.fromkeys(tags))[:8],
+            'signals': signals,
+            'note': note,
+            'dist_high_atr': round(dist_high_atr, 2),
+            'dist_low_atr': round(dist_low_atr, 2),
+            'squeeze_ratio': round(squeeze_ratio, 3),
+            'atr_compress_ratio': round(atr_compress, 3),
+            'volume_build_ratio': round(vol_recent / max(vol_mid, 1e-9), 3) if vol_mid > 0 else 0.0,
+        }
+    except Exception as e:
+        return {
+            'ready': False, 'score': 0.0, 'direction': '中性', 'phase': '雷達失敗',
+            'long_score': 0.0, 'short_score': 0.0, 'tags': [], 'signals': {}, 'note': f'預爆發雷達失敗:{e}',
+        }
+
+
+def _cache_pre_breakout_radar(symbol, radar):
+    try:
+        with PRE_BREAKOUT_RADAR_LOCK:
+            PRE_BREAKOUT_RADAR_CACHE[symbol] = {
+                'ts': time.time(),
+                'radar': dict(radar or {}),
+            }
+    except Exception:
+        pass
+
+
+def _get_pre_breakout_radar(symbol, ttl=180):
+    try:
+        with PRE_BREAKOUT_RADAR_LOCK:
+            row = dict(PRE_BREAKOUT_RADAR_CACHE.get(symbol) or {})
+        if not row:
+            return {}
+        ts = float(row.get('ts', 0) or 0)
+        if ttl and ts and (time.time() - ts) > ttl:
+            return {}
+        return dict(row.get('radar') or {})
+    except Exception:
+        return {}
+
+
 def _detect_squeeze_break_trigger(d15, side):
     c = d15['c'].astype(float); o = d15['o'].astype(float); h = d15['h'].astype(float); l = d15['l'].astype(float); v = d15['v'].astype(float)
     curr = float(c.iloc[-1])
@@ -7279,6 +7492,9 @@ def analyze_legacy_shadow_2(symbol):
         time.sleep(0.08)
         if len(d15) < 80 or len(d4h) < 40 or len(d1d) < 40:
             return 0, '資料不足', 0, 0, 0, 0, {}, 0, 0, 0, 2.0, 3.0
+
+        pre_breakout_radar = analyze_pre_breakout_radar(d15, d4h, d1d)
+        _cache_pre_breakout_radar(symbol, pre_breakout_radar)
 
         curr = float(d15['c'].iloc[-1])
         atr15 = max(safe_last(ta.atr(d15['h'], d15['l'], d15['c'], length=14), curr * 0.004), curr * 0.003)
@@ -8469,10 +8685,33 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
 def analyze(symbol):
     base = _BASE_ANALYZE(symbol)
     try:
-        return _apply_regime_to_signal(symbol, *base)
+        result = _apply_regime_to_signal(symbol, *base)
     except Exception as e:
         print('AI regime overlay失敗 {}: {}'.format(symbol, e))
-        return base
+        result = base
+
+    try:
+        score, desc, entry, sl, tp, est_pnl, breakdown, atr, atr15, atr4h, sl_mult, tp_mult = result
+        breakdown = dict(breakdown or {})
+        radar = _get_pre_breakout_radar(symbol)
+        if radar:
+            breakdown['PreBreakoutScore'] = round(float(radar.get('score', 0.0) or 0.0), 2)
+            breakdown['PreBreakoutDirection'] = str(radar.get('direction') or '中性')
+            breakdown['PreBreakoutPhase'] = str(radar.get('phase') or '觀察')
+            breakdown['PreBreakoutLong'] = round(float(radar.get('long_score', 0.0) or 0.0), 2)
+            breakdown['PreBreakoutShort'] = round(float(radar.get('short_score', 0.0) or 0.0), 2)
+            breakdown['PreBreakoutTag'] = '|'.join((radar.get('tags') or [])[:4])
+            breakdown['PreBreakoutNote'] = str(radar.get('note') or '')
+            if radar.get('ready'):
+                suffix = '預爆發:{}({}/{:.0f})'.format(
+                    breakdown.get('PreBreakoutDirection', '中性'),
+                    breakdown.get('PreBreakoutPhase', '觀察'),
+                    float(radar.get('score', 0.0) or 0.0),
+                )
+                desc = (desc + '|' if desc else '') + suffix
+        return score, desc, entry, sl, tp, est_pnl, breakdown, atr, atr15, atr4h, sl_mult, tp_mult
+    except Exception:
+        return result
 
 def _extract_strategy_key(trade):
     bd = trade.get('breakdown', {}) or {}
