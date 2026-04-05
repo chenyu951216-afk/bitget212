@@ -110,6 +110,10 @@ API_ERROR_STREAK    = 0
 PROTECTION_FAIL_STREAK = 0
 AUTO_AI_MODE = 'normal'
 AI_FULL_SCORE_CONTROL = True
+AI_DISCOVERY_MIN_COUNT = 3
+AI_DISCOVERY_BLEND_FLOOR = 0.08
+AI_DISCOVERY_BLEND_CEIL = 0.72
+AI_LEGACY_WEIGHT_READONLY = True
 LAST_MARKET_CONSENSUS = {}
 CACHE_LOCK          = threading.RLock()
 PROTECTION_LOCK     = threading.RLock()
@@ -2808,13 +2812,11 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
     if AI_FULL_SCORE_CONTROL:
         ai_cov = float(bd.get('AIScoreCoverage', 0) or 0)
         ai_scnt = int(bd.get('AISampleCount', 0) or 0)
-        ai_threshold = base_threshold + float(profile.get('threshold_adjust', 0) or 0)
+        ai_threshold = float(base_threshold) + float(profile.get('threshold_adjust', 0) or 0)
         if phase == 'learning':
-            ai_threshold = max(42.0, min(62.0, ai_threshold - 4.0))
-        elif phase == 'semi':
-            ai_threshold = max(43.0, min(68.0, ai_threshold))
-        else:
-            ai_threshold = max(44.0, min(72.0, ai_threshold + max(0.0, 0.8 - ai_cov) * 4.0))
+            ai_threshold -= 4.0
+        elif phase == 'full':
+            ai_threshold += max(0.0, 0.8 - ai_cov) * 2.5
         if bool(profile.get('symbol_blocked')) or bool(profile.get('strategy_blocked')):
             ai_threshold += 4.0
 
@@ -2823,29 +2825,33 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
         ai_score_adj += eq_adj
         ai_score_adj += ai_cov * 6.0
         ai_score_adj += min(ai_scnt / 18.0, 3.0)
+        if not fit_ok:
+            ai_score_adj -= 1.25
+        if not bool(sig.get('anti_chase_ok', True)):
+            ai_score_adj -= 0.85
 
         decision_calibrator = calibrate_trade_decision(
             score=score + rotation_adj + ai_score_adj,
             threshold=ai_threshold,
-            rr_ratio=max(rr, 0.8),
-            entry_quality=max(eq, 0.5),
+            rr_ratio=max(rr, 0.5),
+            entry_quality=max(eq, 0.1),
             regime_confidence=float(sig.get('regime_confidence', 0.0) or 0.0),
             profile=profile,
             execution_quality=execution_snapshot,
             market_consensus=dict(LAST_MARKET_CONSENSUS or {}),
         )
-        effective_score = score + rotation_adj + ai_score_adj + max(0.0, (decision_calibrator.get('p_win_est', 0.5) - 0.5) * 10.0)
-        setup_ok = bool(fit_ok)
-        if phase == 'full' and ai_scnt < AI_MIN_SAMPLE_EFFECT and ai_cov < 0.12 and score < ai_threshold + 3.0:
-            setup_ok = False
+        p_win_est = float(decision_calibrator.get('p_win_est', 0.5) or 0.5)
+        ev_est = float(decision_calibrator.get('expected_value_est', 0.0) or 0.0)
+        ai_conf_boost = max(0.0, p_win_est - 0.5) * 10.0 + ev_est * 12.0 + ai_cov * 2.0
+        effective_score = score + rotation_adj + ai_score_adj + ai_conf_boost
         gating = {
             'regime': bool(mkt_ok and (not (NEUTRAL_REGIME_BLOCK and regime == 'neutral' and phase == 'full'))),
-            'setup': bool(setup_ok),
+            'setup': True,
             'risk': bool(side_ok and same_dir_cnt < MAX_SAME_DIRECTION and symbol not in already_closing),
             'symbol': bool(symbol not in pos_syms and symbol not in SHORT_TERM_EXCLUDED and can_reenter_symbol(symbol) and sig.get('allowed', True)),
             'trigger': bool(effective_score >= ai_threshold),
-            'calibrated_winrate': bool(float(decision_calibrator.get('p_win_est', 0.0) or 0.0) >= (0.47 if phase == 'learning' else 0.49 if phase == 'semi' else 0.51)),
-            'positive_ev': bool(float(decision_calibrator.get('expected_value_est', -1.0) or -1.0) > (-0.01 if phase == 'learning' else 0.0)),
+            'calibrated_winrate': bool(p_win_est >= (0.465 if phase == 'learning' else 0.485 if phase == 'semi' else 0.505)),
+            'positive_ev': bool(ev_est > (-0.015 if phase == 'learning' else -0.005 if phase == 'semi' else 0.0)),
         }
         base_ok = all(gating.get(k, True) for k in DECISION_PRIORITY_ORDER) and gating.get('calibrated_winrate', True) and gating.get('positive_ev', True)
         ai_ok = True
@@ -2865,21 +2871,22 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
             ai_ok = False
             reasons.append('策略長期虧損封鎖')
         if not fit_ok:
+            reasons.append('結構不完美但僅作AI輔助參考')
             reasons.append(fit_note)
+        if not bool(sig.get('anti_chase_ok', True)):
+            reasons.append('追價風險保留為AI輔助特徵')
         if profile.get('ready'):
             reasons.append('AI策略已就緒')
         if profile.get('note'):
             reasons.append(str(profile.get('note')))
         if eq_note:
-            reasons.append(eq_note)
+            reasons.append(eq_note + '（輔助）')
         reasons.append('AI分數調整 {:+.2f}'.format(ai_score_adj))
-        reasons.append('校準勝率 {:.1f}%'.format(float(decision_calibrator.get('p_win_est', 0.0) or 0.0) * 100.0))
-        reasons.append('校準EV {:+.3f}'.format(float(decision_calibrator.get('expected_value_est', 0.0) or 0.0)))
+        reasons.append('校準勝率 {:.1f}%'.format(p_win_est * 100.0))
+        reasons.append('校準EV {:+.3f}'.format(ev_est))
         if not base_ok:
             if effective_score < ai_threshold:
-                reasons.append('分數未過AI門檻')
-            if not gating.get('setup', True):
-                reasons.append('AI判定結構未對齊')
+                reasons.append('AI綜合分數未過門檻')
             if not gating.get('calibrated_winrate', True):
                 reasons.append('校準勝率不足')
             if not gating.get('positive_ev', True):
@@ -3073,16 +3080,6 @@ def ai_decide_trade(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms,
 
 def build_auto_order_reason(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, pos_syms, already_closing, ai_decision=None):
     reasons = []
-    eq = float(sig.get('entry_quality', 0) or 0)
-    rr = float(sig.get('rr_ratio', 0) or 0)
-    score = abs(float(sig.get('score', 0) or 0))
-    min_entry_quality = 2 if score >= max(eff_threshold + 4, 54) else 3
-    if score < eff_threshold:
-        reasons.append('分數未過門檻')
-    if eq < min_entry_quality:
-        reasons.append('進場品質不足')
-    if rr < MIN_RR_HARD_FLOOR:
-        reasons.append('RR不足')
     if not side_ok:
         reasons.append('方向衝突')
     if sig['symbol'] in pos_syms:
@@ -3099,17 +3096,23 @@ def build_auto_order_reason(sig, eff_threshold, mkt_ok, side_ok, same_dir_cnt, p
         reasons.append('同向持倉已滿')
     if not can_reenter_symbol(sig['symbol']):
         reasons.append('進場冷卻中')
+    if AI_FULL_SCORE_CONTROL:
+        reasons.append('舊RR/進場品質/型態公式已轉為AI輔助特徵')
     if ai_decision:
         profile = dict(ai_decision.get('profile') or {})
-        if profile.get('ready'):
-            reasons.append('AI門檻 {}'.format(ai_decision.get('effective_threshold')))
+        reasons.append('AI有效分數 {}'.format(ai_decision.get('effective_score')))
+        reasons.append('AI門檻 {}'.format(ai_decision.get('effective_threshold')))
+        if profile.get('sample_count') is not None:
             reasons.append('AI樣本 {}'.format(profile.get('sample_count', 0)))
-            reasons.append('AI勝率 {:.1f}%'.format(float(profile.get('win_rate', 0) or 0)))
-            if profile.get('hard_block'):
-                reasons.append('AI封鎖此策略')
-            note = profile.get('note')
-            if note:
-                reasons.append(str(note))
+        dc = dict(ai_decision.get('decision_calibrator') or {})
+        if dc:
+            reasons.append('AI勝率 {:.1f}%'.format(float(dc.get('p_win_est', 0.0) or 0.0) * 100.0))
+            reasons.append('AIEV {:+.3f}'.format(float(dc.get('expected_value_est', 0.0) or 0.0)))
+        if profile.get('hard_block'):
+            reasons.append('AI封鎖此策略')
+        note = profile.get('note')
+        if note:
+            reasons.append(str(note))
     return list(dict.fromkeys(reasons))
 
 def safe_last(series, default=0):
@@ -4666,22 +4669,20 @@ def analyze_legacy_shadow_1(symbol):
         if 'sl' not in locals() or sl is None:
             return 0, '錯誤:no_sl', 0, 0, 0, 0, {'valid': False, 'reason': 'no_tp_sl'}, 0, 0, 0, 2.0, 3.0
 
-        # RR 現在直接作為進場條件的一部分
-        if rr_ratio < 1.35:
-            score *= 0.72
-            breakdown['風報比不足'] = -6 if score > 0 else 6
-            breakdown['valid'] = False
-            breakdown['reason'] = 'rr_gate'
-            tags.append('風報比過低')
+        # RR / 進場品質改成 AI 輔助特徵，不再直接當硬性進場門檻
+        if rr_ratio < 1.10:
+            score *= 0.90
+            breakdown['風報比偏低(輔助)'] = -2 if score > 0 else 2
+            tags.append('風報比偏低(輔助)')
         elif rr_ratio >= 1.8:
-            breakdown['風報比優秀'] = 3 if score > 0 else -3
-            score += 3 if score > 0 else -3
+            breakdown['風報比優秀(輔助)'] = 2 if score > 0 else -2
+            score += 2 if score > 0 else -2
 
-        # 進場品質太差就再降權，避免追價或亂抄底
+        # 進場品質保留為 AI 參考，不再直接卡死訊號
         if abs(entry_s0) <= 0:
-            score *= 0.78
-            breakdown['進場品質過濾'] = -5 if score > 0 else 5
-            tags.append('進場品質不足')
+            score *= 0.90
+            breakdown['進場品質偏弱(輔助)'] = -2 if score > 0 else 2
+            tags.append('進場品質偏弱(輔助)')
 
         atr_pct = atr / max(curr, 1e-9)
         if atr_pct > 0.045:
@@ -5387,72 +5388,55 @@ def learn_from_closed_trade(trade_id):
     return _enqueue_closed_trade_learning(trade_id)
 
 def _auto_adjust_weights(db):
-    """50筆後 AI 真正接管權重（修正版）"""
+    """舊固定權重保留為基礎特徵，不再直接覆蓋 W；改輸出 AI 自主邏輯提示。"""
     try:
-        global W  # ⭐ 關鍵：讓AI可以改全域權重
-
         trades = [t for t in db["trades"] if t["result"] in ("win","loss") and t.get("breakdown")]
-        if len(trades) < 50:
+        if len(trades) < 30:
             return
 
         indicator_stats = {}
-
-        for t in trades:
-            bd = t.get("breakdown", {})
-            is_win = t["result"] == "win"
-
+        for t in trades[-360:]:
+            bd = dict(t.get("breakdown") or {})
+            metric = float(_trade_learn_metric(t) or 0.0)
+            edge = max(min(metric / 2.5, 1.0), -1.0)
             for key, val in bd.items():
-                if key not in indicator_stats:
-                    indicator_stats[key] = {"win_sum":0,"loss_sum":0,"win_n":0,"loss_n":0}
-
-                if is_win:
-                    indicator_stats[key]["win_sum"] += abs(val)
-                    indicator_stats[key]["win_n"] += 1
+                if isinstance(val, bool):
+                    num = 1.0 if val else -1.0
+                elif isinstance(val, (int, float)):
+                    num = float(val)
                 else:
-                    indicator_stats[key]["loss_sum"] += abs(val)
-                    indicator_stats[key]["loss_n"] += 1
+                    continue
+                rec = indicator_stats.setdefault(key, {"count":0,"signed_edge_sum":0.0,"value_abs_sum":0.0})
+                rec["count"] += 1
+                rec["signed_edge_sum"] += edge * (1.0 if num > 0 else -1.0 if num < 0 else 0.0)
+                rec["value_abs_sum"] += min(abs(num), 12.0)
 
+        adaptive_hints = {}
         contrib = {}
-
         for key, st in indicator_stats.items():
-            if st["win_n"] + st["loss_n"] < 10:
+            count = int(st.get("count", 0) or 0)
+            if count < 12:
                 continue
+            signed_edge = float(st.get("signed_edge_sum", 0.0) or 0.0) / max(count, 1)
+            avg_abs = float(st.get("value_abs_sum", 0.0) or 0.0) / max(count, 1)
+            confidence = min(count / 45.0, 1.0) * min(avg_abs / 3.0, 1.0)
+            edge = signed_edge * (0.55 + confidence * 0.45)
+            if abs(edge) < 0.015:
+                continue
+            adaptive_hints[key] = {
+                'edge': round(edge, 6),
+                'confidence': round(confidence, 6),
+                'count': count,
+                'avg_abs_value': round(avg_abs, 6),
+            }
+            contrib[key] = round(abs(edge) * (0.5 + confidence), 6)
 
-            win_avg = st["win_sum"] / max(st["win_n"], 1)
-            loss_avg = st["loss_sum"] / max(st["loss_n"], 1)
-
-            # ⭐ 貢獻度（勝 > 敗 才加分）
-            contrib[key] = max(win_avg - loss_avg, 0.01)
-
-        if not contrib:
-            return
-
-        # ⭐ 正規化 → 變成100分權重
-        total = sum(contrib.values())
-        new_W = {}
-
-        for k, v in contrib.items():
-            new_W[k] = round(v / total * 100)
-
-        # ⭐ 補滿100（避免誤差）
-        diff = 100 - sum(new_W.values())
-        if diff != 0:
-            first_key = list(new_W.keys())[0]
-            new_W[first_key] += diff
-
-        # ⭐ 覆蓋原本權重（核心修復）
-        for k in new_W:
-            if k in W:
-                W[k] = new_W[k]
-
-        # ⭐ 存DB（保留你原本功能）
-        db["indicator_contrib"] = {k: round(v, 3) for k, v in contrib.items()}
-
-        print("🧠 AI權重已接管:", W)
+        db["indicator_contrib"] = contrib
+        db["adaptive_indicator_hints"] = adaptive_hints
+        print("🧠 AI邏輯提示已更新(固定權重僅保留為基礎特徵)，提示數:", len(adaptive_hints))
 
     except Exception as e:
         print("權重調整失敗:", e)
-
 
 
 def _refresh_learn_summary():
@@ -7726,9 +7710,7 @@ def get_regime_params(regime):
     with AI_LOCK:
         return dict(AI_DB.get('param_sets', {}).get(regime, AI_DB.get('param_sets', {}).get('neutral', {})))
 
-# 正式別名：固定綁到保留版實作，避免 legacy shadow 名稱干擾
-analyze = analyze_legacy_shadow_1
-run_simple_backtest = run_simple_backtest_legacy_shadow_1
+# 基底別名：保留 v1 做為底層特徵產生器；真正對外 analyze / backtest 會在後段綁到增強版
 _BASE_ANALYZE = analyze_legacy_shadow_1
 _BASE_LEARN_FROM_CLOSED_TRADE = learn_from_closed_trade_legacy_shadow_1
 _BASE_RUN_SIMPLE_BACKTEST = run_simple_backtest_legacy_shadow_1
@@ -7798,6 +7780,75 @@ def _infer_signal_side(score, entry=0.0, sl=0.0, tp=0.0):
     return 1 if _safe_num(score) >= 0 else -1
 
 
+
+def _derive_signal_fingerprint(symbol, side, breakdown=None, regime_info=None, desc='', extra=None):
+    bd = dict(breakdown or {})
+    regime_info = dict(regime_info or {})
+    fp = {}
+    rr = _safe_num(bd.get('RR', 0.0))
+    entry_gate = _safe_num(bd.get('EntryGate', bd.get('進場品質', 0.0)))
+    vwap_bias = _safe_num(bd.get('VWAP', 0.0))
+    regime_bias = _safe_num(bd.get('RegimeBias', bd.get('方向品質', 0.0)))
+    anti_chase = _safe_num(bd.get('追價風險', 0.0))
+    tempo_score = _safe_num(regime_info.get('tempo_score', 0.0))
+    vol_ratio = _safe_num(regime_info.get('vol_ratio', 0.0))
+    conf = _safe_num(regime_info.get('confidence', 0.0))
+    fp['rr_bucket'] = 'rr_hi' if rr >= 2.0 else 'rr_mid' if rr >= 1.35 else 'rr_low'
+    fp['entry_bucket'] = 'entry_hi' if entry_gate >= 7 else 'entry_mid' if entry_gate >= 4 else 'entry_low'
+    fp['tempo_bucket'] = 'tempo_fast' if tempo_score >= 0.55 else 'tempo_slow' if tempo_score <= -0.25 else 'tempo_normal'
+    fp['chase_bucket'] = 'chase_risk' if anti_chase < 0 else 'chase_ok'
+    fp['vol_bucket'] = 'vol_expand' if vol_ratio >= 1.35 else 'vol_dry' if vol_ratio <= 0.78 else 'vol_normal'
+    fp['regime_align'] = 'align_yes' if regime_bias * side > 0 else 'align_no' if regime_bias * side < 0 else 'align_flat'
+    fp['vwap_bucket'] = 'vwap_above' if vwap_bias * side > 0 else 'vwap_below' if vwap_bias * side < 0 else 'vwap_flat'
+    fp['confidence_bucket'] = 'conf_hi' if conf >= 0.78 else 'conf_mid' if conf >= 0.55 else 'conf_low'
+    session_bucket = str((regime_info.get('session_bucket') or bd.get('SessionBucket') or session_bucket_from_hour(get_tw_time().hour) or 'unknown')).strip() or 'unknown'
+    fp['session_bucket'] = session_bucket
+    if isinstance(desc, str) and desc:
+        desc_l = desc.lower()
+        if '突破' in desc or 'breakout' in desc_l:
+            fp['trigger_family'] = 'breakout'
+        elif '回踩' in desc or 'pullback' in desc_l:
+            fp['trigger_family'] = 'pullback'
+        elif '掃' in desc or 'sweep' in desc_l:
+            fp['trigger_family'] = 'liquidity_sweep'
+        elif '區間' in desc or 'range' in desc_l:
+            fp['trigger_family'] = 'range_revert'
+    if not fp.get('trigger_family'):
+        setup = str(bd.get('Setup') or '').lower()
+        if 'break' in setup:
+            fp['trigger_family'] = 'breakout'
+        elif 'pull' in setup:
+            fp['trigger_family'] = 'pullback'
+        else:
+            fp['trigger_family'] = 'generic'
+    fp['symbol_family'] = str(symbol or 'NA').split('/')[0][:12] or 'NA'
+    return fp
+
+
+def _adaptive_indicator_hint_score(breakdown=None):
+    bd = dict(breakdown or {})
+    with AI_LOCK:
+        hints = dict((AI_DB.get('adaptive_indicator_hints') or {}))
+    if not hints:
+        return 0.0, []
+    raw = 0.0
+    covered = []
+    for key, value in bd.items():
+        meta = hints.get(str(key))
+        if not meta:
+            continue
+        val = _safe_num(value, None)
+        if val is None:
+            continue
+        direction = 1.0 if val > 0 else -1.0 if val < 0 else 0.0
+        strength = min(abs(float(val)), 10.0) / 10.0
+        edge = float(meta.get('edge', 0.0) or 0.0)
+        conf = float(meta.get('confidence', 0.0) or 0.0)
+        contrib = direction * edge * (0.35 + strength * 0.65) * conf * 8.0
+        raw += contrib
+        covered.append((str(key), round(contrib, 4), int(meta.get('count', 0) or 0)))
+    return raw, covered
+
 def _extract_ai_signal_features(symbol, side, breakdown=None, regime_info=None, desc='', extra=None):
     bd = dict(breakdown or {})
     regime_info = dict(regime_info or {})
@@ -7861,6 +7912,23 @@ def _extract_ai_signal_features(symbol, side, breakdown=None, regime_info=None, 
         tags.extend([str(x).strip() for x in extra if str(x).strip()][:20])
     for tag in tags[:30]:
         add(f'tag::{tag}', 1.0)
+
+    fingerprint = _derive_signal_fingerprint(symbol, side, breakdown=bd, regime_info=regime_info, desc=desc, extra=extra)
+    for fk, fv in fingerprint.items():
+        add(f'fp::{fk}::{fv}', 1.0)
+
+    with AI_LOCK:
+        adaptive_hints = dict((AI_DB.get('adaptive_indicator_hints') or {}))
+    for hk, meta in adaptive_hints.items():
+        if hk not in bd:
+            continue
+        val = _safe_num(bd.get(hk), 0.0)
+        if abs(val) <= 1e-9:
+            continue
+        hint_edge = float(meta.get('edge', 0.0) or 0.0)
+        hint_conf = float(meta.get('confidence', 0.0) or 0.0)
+        scaled = _ai_feature_scale(hk, val) * max(min(hint_edge * max(hint_conf, 0.15), 2.0), -2.0)
+        add(f'hint::{hk}', scaled)
 
     return feats
 
@@ -7950,7 +8018,6 @@ def _score_signal_with_ai_model(symbol, side, breakdown=None, regime_info=None, 
     feature_model = dict(model.get('features') or {})
     covered = []
     raw = 0.0
-    total_abs = 0.0
     for feat, val in features.items():
         meta = feature_model.get(feat)
         if not meta:
@@ -7959,9 +8026,8 @@ def _score_signal_with_ai_model(symbol, side, breakdown=None, regime_info=None, 
         weight = float(meta.get('weight', 0.0) or 0.0)
         contrib = float(val) * weight * conf
         raw += contrib
-        total_abs += abs(weight * conf)
         covered.append((feat, round(contrib, 4), int(meta.get('count', 0) or 0)))
-    coverage = min(len(covered) / 12.0, 1.0)
+    coverage = min(len(covered) / 14.0, 1.0)
     meta = dict(model.get('meta') or {})
     sample_cnt = int(meta.get('samples', 0) or 0)
     sample_conf = min(sample_cnt / 60.0, 1.0)
@@ -7969,19 +8035,26 @@ def _score_signal_with_ai_model(symbol, side, breakdown=None, regime_info=None, 
     profile = _ai_strategy_profile(symbol, regime=str((breakdown or {}).get('Regime') or (regime_info or {}).get('regime') or 'neutral'), setup=str((breakdown or {}).get('Setup') or ''))
     strategy_boost = float(strategy.get('ev_per_trade', 0.0) or 0.0) * 22.0 + (float(strategy.get('win_rate', 50.0) or 50.0) - 50.0) * 0.10
     profile_boost = float(profile.get('ev_per_trade', 0.0) or 0.0) * 16.0 + (float(profile.get('win_rate', 50.0) or 50.0) - 50.0) * 0.06
-    base_from_model = raw * 7.2 + strategy_boost + profile_boost
+    hint_score, hint_covered = _adaptive_indicator_hint_score(breakdown=breakdown)
+    discovered_logic_count = len(covered) + len(hint_covered)
+    discovery_strength = min(discovered_logic_count / 18.0, 1.0)
+    base_from_model = raw * 7.2 + strategy_boost + profile_boost + hint_score
+    adaptive_blend = max(AI_DISCOVERY_BLEND_FLOOR, min(AI_DISCOVERY_BLEND_CEIL, sample_conf * 0.52 + coverage * 0.28 + discovery_strength * 0.20))
     fallback_weight = 0.0 if AI_FULL_SCORE_CONTROL else max(0.15, 1.0 - sample_conf * 0.7)
-    mixed = base_from_model + float(fallback_score or 0.0) * fallback_weight
+    mixed = base_from_model * adaptive_blend + float(fallback_score or 0.0) * max(1.0 - adaptive_blend, fallback_weight)
     score = max(min(round(mixed, 2), 100.0), -100.0)
+    top = sorted(covered + [('hint::' + f, c, n) for f, c, n in hint_covered], key=lambda x: abs(x[1]), reverse=True)[:12]
     return {
         'score': score,
         'coverage': round(coverage, 4),
         'sample_confidence': round(sample_conf, 4),
         'sample_count': sample_cnt,
         'raw': round(raw, 6),
-        'strategy_boost': round(strategy_boost + profile_boost, 4),
+        'strategy_boost': round(strategy_boost + profile_boost + hint_score, 4),
+        'adaptive_blend': round(adaptive_blend, 4),
+        'discovered_logic_count': int(discovered_logic_count),
         'top_contributors': [
-            {'feature': f, 'contribution': c, 'count': n} for f, c, n in sorted(covered, key=lambda x: abs(x[1]), reverse=True)[:12]
+            {'feature': f, 'contribution': c, 'count': n} for f, c, n in top
         ],
     }
 
@@ -8335,6 +8408,8 @@ def _apply_regime_to_signal(symbol, score, desc, entry, sl, tp, est_pnl, breakdo
     breakdown['AISampleConfidence'] = round(float(ai_score_payload.get('sample_confidence', 0.0) or 0.0), 3)
     breakdown['AISampleCount'] = int(ai_score_payload.get('sample_count', 0) or 0)
     breakdown['AIStrategyBoost'] = round(float(ai_score_payload.get('strategy_boost', 0.0) or 0.0), 3)
+    breakdown['AIAdaptiveBlend'] = round(float(ai_score_payload.get('adaptive_blend', 0.0) or 0.0), 3)
+    breakdown['AIDiscoveredLogicCount'] = int(ai_score_payload.get('discovered_logic_count', 0) or 0)
     top_ai = ai_score_payload.get('top_contributors', []) or []
     if top_ai:
         breakdown['AITopFeature'] = str(top_ai[0].get('feature') or '')
@@ -8541,6 +8616,10 @@ def run_simple_backtest_legacy_shadow_2(symbol='BTC/USDT:USDT', timeframe='15m',
     base['ai_params'] = params
     base['ai_comment'] = f"{symbol} 當前屬於 {regime.get('regime')}，回測以 {regime.get('note')} 參考調參"
     return base
+
+# 正式對外綁定到增強版，避免仍落回 legacy v1
+run_simple_backtest = run_simple_backtest_legacy_shadow_2
+_LEARNING_WORKER = learn_from_closed_trade_legacy_shadow_2
 
 def run_multi_market_backtest(symbols=None):
     started_at = time.time()
